@@ -1,0 +1,39 @@
+# --- Secrets ---
+.env
+.env.local
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# --- Editors / IDEs ---
+.idea/
+.vscode/
+.claude/
+
+# --- Benchmark / private evaluation data ---
+# _bench/ contains conversion outputs from real business documents
+# (e.g. CoverGo Proposal) that must NEVER go public.
+_bench/
+
+# --- Test outputs (regenerable via tests/run_smoke.py) ---
+tests/output/
+
+# --- Large test fixtures (regenerable via tests/make_fixtures.py) ---
+# Small fixtures (PPTX/DOCX/XLSX/HTML/PNG) are committed for quick testing.
+# Big binary PDFs are excluded to keep the repo lean.
+tests/fixtures/sample.pdf
+tests/fixtures/dedup_test.pdf
+tests/fixtures/scanned.pdf
+
+# --- Runtime / logs ---
+*.log
+_screenshots/
