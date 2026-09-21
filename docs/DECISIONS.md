@@ -204,3 +204,165 @@ Trigger modes: `never` (default, preserves existing behavior), `auto` (heuristic
 **Decision**: (B). `config.py` does `Path(__file__).resolve().parent.parent / ".env"`. Also does a CWD fallback so shell workflows keep working.
 
 **Consequences**: Shortcut-launch works. Users who run from arbitrary CWDs also work because the CWD fallback is still there.
+
+---
+
+## 2026-09-21 — PDF heading & paragraph detection: font-size clustering + numbering regex
+
+**Context**: Benchmark against Microsoft markitdown and Claude-direct on a 57-page CoverGo RFP showed AnyToMD had 2 headings (just the title + one) vs Claude's 77 vs 0 for markitdown. Body paragraphs were also hard-wrapped mid-sentence because PyMuPDF `get_text("blocks")` splits at whatever visual block boundary PDF has.
+
+**Options**:
+- (A) Leave as-is. Text extract still works, just no MD structure.
+- (B) Use PDF outline (bookmarks) if present. Only works for well-authored PDFs.
+- (C) `page.get_text("dict")` for span-level font info + cluster font sizes globally to determine heading tiers.
+- (D) LLM post-process the extracted text to add structure. Expensive, non-deterministic.
+
+**Decision**: (B) + (C). Outline used when present (`doc.get_toc()`); otherwise fall back to font-size clustering. Modal font size across all blocks = "body". Ratios 1.6× / 1.3× / 1.15×+bold → H2/H3/H4. Numbering pattern `^\d+(\.\d+){0,3}` boosts to explicit numbered heading. Paragraph merge across adjacent blocks with same x-indent and no sentence terminator.
+
+**Consequences**:
+- Heading count jumped from 2 → 104 on the CoverGo benchmark, surpassing Claude direct (77).
+- The upgrade from `get_text("blocks")` to `get_text("dict")` was mechanical but touched the whole extract pipeline. Kept `_Block` shape but enriched with `x0`, `max_font_size`, `is_bold`.
+- Doesn't help for scanned PDFs — those go through OCR, no font info.
+
+---
+
+## 2026-09-21 — pdfplumber column-collapse strategy for over-detected tables
+
+**Context**: pdfplumber's default `find_tables()` over-segments tables when the source PDF has many light vertical rulings (common in Google Slides / InDesign exports). CoverGo Cloud Hosting Options table came out as 9 columns of which 6 were empty pad columns.
+
+**Options**:
+- (A) Tune `table_settings` more strictly. Rejects legit tables like the SLA one.
+- (B) Post-process: drop columns that are 100%-empty across all rows.
+- (C) Post-process: merge adjacent columns whose non-empty rows are disjoint (spurious split from one wide cell into narrow siblings).
+- (D) Reject any table with >40% empty cells + >4 cols as false positive.
+
+**Decision**: (B) + (C) + (D) combined. Also added a two-pass strategy: `lines` first, `text` clustering as per-page fallback when `lines` found nothing.
+
+**Consequences**:
+- Cloud Hosting Options came out as a clean 3-col table.
+- SLA and RACI tables (4+ cols) survived. Some multi-line headers still get split — acceptable for v1.
+- Text-strategy fallback is expensive (extra pass) but only per-page-with-no-tables. Adds ~5s on CoverGo PDF.
+
+---
+
+## 2026-09-21 — Direct PPTX shape → Mermaid extraction (bypass VLM entirely)
+
+**Context**: PPTX shape diagrams (auto shapes + connectors) were being rasterized by our PIL renderer and sent to a VLM for Mermaid regeneration. This was our main advantage over markitdown (which skips them entirely) but had two problems: (1) Ollama qwen2.5vl:7b regularly produced broken Mermaid, (2) even when Mermaid was valid, node labels sometimes drifted from the source ("Deploy" → "Deploys").
+
+**Options**:
+- (A) Ship better prompts + accept VLM randomness.
+- (B) Require Anthropic for shape diagrams. Costs tokens.
+- (C) Parse the shape XML directly: auto-shapes → nodes with `text_frame.text`; LINE connectors → edges by matching endpoints to node bboxes; textboxes near midpoints → edge labels.
+
+**Decision**: (C). New module `pptx_shape_mermaid.py` with `try_extract_mermaid(slide, shapes) -> str | None`. Falls back to raster+VLM only when the graph can't be recovered cleanly (missing endpoints, <2 nodes, <50% nodes connected).
+
+**Consequences**:
+- Fixture `shape_diagram.pptx` conversion time: 5.3s (Ollama VLM) → 0.01s (deterministic XML).
+- 100% correct labels (they come from `shape.text_frame.text` verbatim).
+- Direction inference from majority edge orientation is heuristic; sometimes produces `LR` where `TD` would read better. Acceptable — user can flip after the fact.
+- Fallback to raster+VLM still there for edge cases (SmartArt, grouped shapes with complex nesting).
+
+---
+
+## 2026-09-21 — Ollama demoted to "fallback / graceful degradation" (Opsi B)
+
+**Context**: Benchmark showed Ollama qwen2.5vl:7b gave generic one-line descriptions on info-dense diagrams (business capability model, org charts, gantt) where Claude gave multi-paragraph structured narration. User asked "apakah worth menyertakan Ollama". Full removal (Opsi A) considered.
+
+**Options**:
+- (A) Remove Ollama entirely. Simplifies code (drop ~150 lines) but breaks: offline mode, fallback chain, budget-cap graceful degradation, free smoke testing.
+- (B) Keep Ollama, change default provider to Anthropic. Ollama positioned as fallback / offline mode / testing.
+- (C) Replace with a larger local VLM. Doesn't address root cause — 7B VLMs are inherently weaker at info-dense diagrams.
+
+**Decision**: (B). `.env.example` default `ANYTOMD_PROVIDER=anthropic`. Docs explicit: "Ollama untuk offline / testing / graceful degradation". Fallback chain in HybridAIClient always tries Ollama first when primary fails (free).
+
+**Consequences**:
+- New users get Claude quality out of the box (assuming API key present).
+- Testing without paying: still works via Ollama.
+- Budget cap gracefully downgrades to Ollama instead of hard-stopping.
+- Docs are honest about Ollama's quality gap for info-dense images.
+
+---
+
+## 2026-09-21 — Multi-provider: OpenAI, Gemini, Moonshot (Kimi) alongside Anthropic + Ollama
+
+**Context**: User wanted choice of cloud providers with different price/quality tradeoffs. Also enables hybrid routing (diagram → best provider, photo → cheapest).
+
+**Options**:
+- (A) Anthropic + Ollama only (status quo). Simplest.
+- (B) Add all major cloud vision providers. More SDKs, more testing surface.
+- (C) Wrap everything in a single OpenAI-compatible interface (many providers offer this). Loses provider-specific features (Anthropic cache_control, Gemini native).
+
+**Decision**: (B) with native SDK per provider where it matters. `OpenAIClient` uses `openai` package; `MoonshotClient` extends `OpenAIClient` with `base_url` swap (Kimi is OpenAI-compatible). `GeminiClient` uses `google-genai` (Gemini has best native support there). Anthropic keeps its Messages API for prompt caching. All SDKs deferred-imported (app runs without them if unused).
+
+**Consequences**:
+- 5 provider clients total. `create_client(config)` factory dispatches by config.provider or returns `HybridAIClient` if hybrid routing configured.
+- Cost estimates diverge per provider — `_COST_TABLE` in `config.py` needs manual tuning per model.
+- GUI dropdown gained 3 items. Settings dialog "Model & endpoint" tab per-provider model IDs.
+- Testing gap: only Anthropic + Ollama actually smoke-tested on this box (no other keys). OpenAI / Gemini / Moonshot verified only at construction + config-parsing level.
+
+---
+
+## 2026-09-21 — Hybrid AI routing with local classifier + budget cap + fallback chain
+
+**Context**: Per-conversion image mix is diverse — a proposal has decorative circles, screenshot UIs, architecture diagrams, and photos. Sending all to Claude wastes tokens (photos don't need premium); sending all to Ollama loses quality (diagrams suffer). User wants "diagram → Claude, photo → Gemini, etc." with a budget cap.
+
+**Options**:
+- (A) Manual per-file provider choice. Too much friction.
+- (B) Route by image kind, classified locally (no AI cost). Simple to reason about.
+- (C) Route by AI-in-the-loop classification (send image to cheap AI first, then premium). Two-pass, defeats the purpose.
+
+**Decision**: (B). New `image_heuristics.classify_image()` returns one of `decorative/photo/chart/screenshot/diagram/unknown` from cheap PIL analysis (edge density, distinct colors, white ratio). `HybridAIClient` uses that label + `config.provider_for_kind(kind)` to pick provider. Budget cap `ANYTOMD_COST_CAP_USD` triggers auto-downgrade to Ollama when hit. Fallback chain: on error, try Ollama (free) first, then any other cloud provider whose key exists.
+
+**Consequences**:
+- Predictable per-conversion cost — user knows diagram-heavy files cost more.
+- Local classifier is imperfect (screenshots with white backgrounds sometimes labeled `diagram`); false-positives get high-quality treatment which is fine, false-negatives are the failure mode we care about — mitigated by conservative thresholds.
+- Cost display in GUI status bar surfaces `est_cost_usd` from `HybridAIClient._estimated_cost_usd`.
+- Fallback chain is silent — user only sees the final result. Errors that hit fallback logged via progress signal ("Anthropic error, retry via Ollama") in a future iteration.
+
+---
+
+## 2026-09-21 — Secure API key storage: Windows Credential Manager via `keyring`
+
+**Context**: Storing API keys in plain-text `.env` has real risks: accidental git commit, backup exposure, screen-share leaks, cloud sync (OneDrive, iCloud). User asked for secure GUI input.
+
+**Options**:
+- (A) Session-only input (paste each time). No persistence. High friction.
+- (B) Encrypted file with user-provided master password (Fernet/AES). User has to remember password.
+- (C) OS credential store via `keyring` package. Uses OS-native crypto (Windows DPAPI, macOS Keychain, Linux Secret Service). No master password.
+- (D) Custom encryption with hardcoded key. Security theater.
+
+**Decision**: (C). New `anytomd/keystore.py` wraps `keyring`. On Windows, backend is `WinVaultKeyring` — encrypts via DPAPI using the user's Windows login as the key. `.env` still supported for backwards-compat and CI/scripts. Precedence: env var → keyring → empty.
+
+**Consequences**:
+- Docs must be honest: this protects against **casual disk theft, accidental commit, screen leak** — NOT against malware running as the same user (which can read the credential vault) or process memory dumps. Threat model documented in Settings → Info tab.
+- Portable between machines requires re-entry (feature: prevents key exfil via cloud file sync).
+- Adds `keyring>=25.0.0` dependency, ~10 sub-deps including pywin32-ctypes on Windows.
+- GUI: Settings → API Keys tab shows source per provider (`📄 dari environment` / `🔑 tersimpan (keyring)` / `❌ belum ada`). Key never displayed after save — even a "peek" toggle in the input dialog only reveals during typing, not for retrieval.
+
+---
+
+## 2026-09-21 — GUI rombak: menubar + toolbar + hero drop zone + splitter + status bar
+
+**Context**: Initial GUI had everything stacked vertically in a `QVBoxLayout` — drop zone at top, provider panel, options panel, buttons row at bottom (Browse/Save/Settings all at bottom), status label, preview. User feedback: "Settings di bawah tersembunyi. Browse juga di bawah. Gimana sih. UI/UX kurang bagus. Buat GUI yang rapi."
+
+**Options**:
+- (A) Just reorder widgets. Cosmetic, still cramped.
+- (B) Sidebar-driven layout (VSCode/Figma style). Heavy for a small tool.
+- (C) Standard desktop app pattern: `QMenuBar` + `QToolBar` + central content + `QStatusBar`. Familiar to Windows users.
+- (D) Wizard-style (step 1 → 2 → 3). Bad for repeated use.
+
+**Decision**: (C). `MainWindow` uses:
+- `menuBar()` — File / Settings / Help (with keyboard shortcuts Ctrl+O, Ctrl+S, Ctrl+,, Ctrl+Q).
+- `QToolBar` — Open · Save · Provider dropdown · spacer · Settings (always visible).
+- `QSplitter(Qt.Vertical)` — top: hero drop zone (min 220px, dashed border, hover state, click-to-browse) + options row (2 group boxes side-by-side); bottom: preview area with Copy button. User can drag splitter to resize.
+- `QStatusBar` — status message (left) + progress bar (right) + cost label (permanent right).
+- Global QSS: subtle neutral palette, rounded borders, primary button blue.
+
+All rarely-changed config (API keys, hybrid routing, model IDs, base URLs, cost cap) moved to `SettingsDialog` — modal, 5 tabs (API Keys / Hybrid routing / Model & endpoint / Advanced / Info). Main window is for **operational choices per conversion**; Settings is for **persistent config**.
+
+**Consequences**:
+- Primary action (Browse) elevated to hero drop-zone (click-to-browse) + toolbar Open button + File menu + Ctrl+O — 4 discovery paths.
+- Preview area dominates the visual weight, matching its role as the output view.
+- Provider switching between conversions stays in the toolbar (frequent action). Hybrid routing tucked into Settings (set once, rarely touched).
+- QSS is minimal — heavy styling breaks on macOS/Linux. Current palette works with native controls beneath.
+- `ProviderPanel` widget kept in code (embeddable) but unused in current MainWindow — could be re-added if we ever want a "quick advanced settings" sidebar.
