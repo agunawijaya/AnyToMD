@@ -23,6 +23,54 @@ For a 6-page report with a header logo on every page + 1 real diagram, this drop
 
 ---
 
+## Quick start
+
+```powershell
+git clone https://github.com/agunawijaya/AnyToMD.git
+cd AnyToMD
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# Configure at least ONE provider (Anthropic recommended for quality)
+# Option A: via .env (copy .env.example and fill in)
+Copy-Item .env.example .env
+notepad .env
+# Option B: launch GUI and use Settings → API Keys (Ctrl+,)
+python -m anytomd
+```
+
+Drag any PDF/PPTX/DOCX/XLSX/HTML/image into the drop zone, or press Ctrl+O.
+
+## GUI at a glance
+
+```
+┌─ File   Settings   Help                            ← menu bar
+├─ [📂 Open]  [💾 Save]  │  Provider [Claude ▼]  │  [⚙ Settings]
+├─────────────────────────────────────────────────
+│                                                 
+│    ╔═════════════════════════════════════╗     ← hero drop zone
+│    ║      Drop file here — or click      ║       (dashed border,
+│    ║   PDF · PPTX · DOCX · XLSX · HTML   ║        click to browse)
+│    ╚═════════════════════════════════════╝     
+│                                                 
+│  [ Filter gambar ]        [ OCR untuk PDF scan ]  ← options side-by-side
+│                                                 
+├──── draggable splitter ────────────────────────
+│  Preview                              [📋 Copy]  ← preview grows to fill
+│  ┌─ # Document Title                       ─┐  
+│  │ ## Section 1                              │  
+│  │ ...                                       │  
+├─────────────────────────────────────────────────
+│ Siap · Anthropic · Claude Sonnet 4.6    $0.012 ← status bar
+```
+
+Settings dialog has 5 tabs: **API Keys** (secure per-provider) · **Hybrid routing** (per image kind) · **Model & endpoint** · **Advanced** (budget cap) · **Info**.
+
+Keyboard shortcuts: `Ctrl+O` open · `Ctrl+S` save · `Ctrl+,` settings · `Ctrl+Q` exit.
+
+---
+
 ## Supported formats
 
 Convert **PDF**, **PPTX**, **DOCX**, **XLSX**, **HTML**, and **PNG/JPG** files into clean Markdown.
@@ -42,9 +90,9 @@ Lima backend untuk vision tasks — **plus hybrid mode** yang bisa route per-jen
 - **`moonshot`** — Kimi `moonshot-v1-32k-vision-preview` (Chinese vision LLM, OpenAI-compatible).
 - **`ollama`** — offline `qwen2.5vl:7b` (~8 GB VRAM). Positioned sebagai **fallback / graceful degradation / testing**, bukan first-class. Kualitas VLM 7B lokal lebih rendah untuk diagram info-dense.
 
-Provider dipilih via **GUI dropdown** ("Pilih AI provider" panel di jendela utama) atau `.env`.
+Provider dipilih via **dropdown di toolbar** untuk switching cepat, atau di Settings → Hybrid routing untuk konfigurasi per-jenis-gambar.
 
-**Secure API key storage**: GUI menyediakan panel "API keys" dengan tombol `Set…` / `Ubah…` / `Hapus` per provider. Kunci disimpan terenkripsi via **Windows Credential Manager (DPAPI)** — bukan plain text di `.env`. Precedence: environment variable → keyring → kosong. `.env` tetap didukung untuk backwards-compat dan skenario CI/script. Kunci tidak pernah ditampilkan di UI setelah disimpan.
+**Secure API key storage**: buka **Settings → API Keys** (Ctrl+,) untuk mengelola kunci per provider. Kunci disimpan terenkripsi via **Windows Credential Manager (DPAPI)** — bukan plain text di `.env`. Precedence: environment variable → keyring → kosong. `.env` tetap didukung untuk backwards-compat dan skenario CI/script. Kunci tidak pernah ditampilkan di UI setelah disimpan.
 
 **Hybrid mode** — set per-jenis-gambar ke provider berbeda:
 ```
