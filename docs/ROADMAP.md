@@ -8,12 +8,36 @@ Ordered by rough priority. This is where "what next" lives — when the user say
 - **P1** — nice-to-have quality/UX improvements
 - **P2** — bigger features, only if user asks
 
+## Recently completed (2026-09-27) — PDF slide decks
+
+Motivated by two real slide decks exported from LibreOffice Impress (client
+material, 4 + 14 pages) where the PDF path lost diagrams, tables and reading order and
+emitted ~740 image placeholders. See [DECISIONS](DECISIONS.md) 2026-09-27.
+
+- **Page vision** (`pdf_page_vision`, `ANYTOMD_PDF_PAGE_VISION`, GUI group "PDF slide → AI per halaman") — slide decks + cloud model: each page rendered and transcribed by the vision model, anchored on the text layer; Mermaid for connected boxes, tables for grids, `###` for panels. Coverage / invented-word / Mermaid checks with one retry; per-page fallback to text extraction on error. 4 pages in parallel.
+- **Vector hints** (`converters/pdf_vector.py`) — legend colour per box (`{legend: X}`), box styles, connectors with direction and badge labels, all read from the PDF drawing.
+- **Painted-only images** (`_drawn_images`) — `get_image_info` instead of `get_images` (resources shared across pages). **Template images** (painted on ≥50% of pages) skipped. Images placed at their y-position.
+- **Silent placeholders** — decorative / tiny / duplicate images emit nothing.
+- **Description language** (`anytomd/lang.py`) — PDF image descriptions in the document's language.
+- **Heading false positives** — number badges and small step labels no longer `##`.
+- **Whole-word table cells** (`_table_from_words`) — text-strategy tables no longer cut words at the bbox edge. CoverGo: word loss 1.3% → 0.0%, table rows 100 → 122 (no-AI run).
+- **Mermaid validator** — ignores quoted label content, catches multi-line quoted labels, unbalanced shapes, unclosed subgraphs, unquoted `(…)` in `[…]`; autofix for the last two kinds. Checked against the real Mermaid parser (node + `mermaid@11` + jsdom).
+- Tests: `tests/run_pdf_unit.py` (offline, 44 checks), `tests/run_page_vision_smoke.py` (cloud), fixture `slide_deck.pdf`.
+
+**Still open from this work:**
+- PPTX/DOCX image descriptions still default to Bahasa Indonesia (language detection only wired into PDF).
+- Slide decks with Ollama use the text path: better than before, but vector diagrams and borderless tables are still flat text there. Try `ANYTOMD_PDF_PAGE_VISION=always` with a stronger local VLM if one becomes available.
+- `.odp` input is not supported (the decks that prompted this came from Impress); PPTX input gives better results than its PDF export.
+
 ## Recently completed (2026-09-21) — post-benchmark v2 (Sprints 1-4)
 
 Motivated by benchmark against Microsoft's `markitdown` and Claude-direct on
 a real 57-page RFP PDF (CoverGo). AnyToMD now surpasses both on heading count
 (104 vs 0 / 77) and table row capture (114 vs 46 / 63), while remaining
 100% offline-capable and adding a hybrid cloud mode for premium image quality.
+*(2026-09-27 correction: part of those table rows had words cut at the table
+edge — 129 words (1.3%) were silently lost. Fixed by `_table_from_words`; a
+no-AI run now gives 122 table rows with 0.0% word loss.)*
 
 ### Sprint 1 — quick wins (nol AI cost)
 
@@ -68,7 +92,7 @@ where structured data already gives us a truthful answer.
 
 ### 1. Verify Anthropic path with a real API key
 
-**Status**: not started. Code exists (`AnthropicClient`), never exercised end-to-end on this box because no key is configured.
+**Status**: **done 2026-09-27** — key stored in Windows Credential Manager; `claude-sonnet-4-6` exercised end-to-end on image descriptions (two real slide decks) and on PDF page vision (`tests/run_page_vision_smoke.py`, 18 real slide pages). `tests/run_smoke.py` still forces Ollama; the Anthropic comparison for its fixtures is not written up.
 
 **Steps**:
 1. User sets `ANTHROPIC_API_KEY` in `.env` and switches `ANYTOMD_PROVIDER=anthropic`.
@@ -78,7 +102,7 @@ where structured data already gives us a truthful answer.
 
 ### 2. Initialize as git repo + first commit
 
-**Status**: project is **not** a git repo (`git status` will error). Feels like a v1.0 hygiene item.
+**Status**: **done** — the project is a git repo on `main` (initial commit `973c5bf`).
 
 **Steps**:
 ```powershell
@@ -205,7 +229,8 @@ If Anthropic call fails (network, rate limit), fall back to Ollama automatically
 ## Bug watch (things noticed but not chased)
 
 - **Anthropic base64 media_type is hardcoded to `image/png`** even though we resize to PNG anyway; if input was originally JPEG we still send it as PNG. Not a bug (works), but the `media_type` parameter to `analyze_image` is unused for that branch. Consider removing the parameter or honoring it.
-- **`_looks_like_valid_mermaid` doesn't validate individual node references** — just first-line + regex-bad-patterns. A completely nonsensical body like `flowchart TD\nasdf ijkl` would pass. Description-quality VLMs don't produce that in practice, but a real parser (mermaid-cli) would be more robust.
+- **`_validate_mermaid` doesn't validate individual node references** — first-line + regex patterns + (since 2026-09-27) quote/bracket/subgraph balance. A nonsensical body like `flowchart TD\nasdf ijkl` would still pass. The real parser (`mermaid@11` under node + jsdom, ~15 s startup) was used to verify outputs during development; wiring it in as an optional check is possible since node is on this box.
+- **Text blocks beside a table are dropped** — `_block_in_any_table` only compares the block's y-midpoint with the table's vertical band, ignoring x. Prose in a second column next to a table disappears. Not seen in the word-loss checks run so far, but a two-column layout would hit it.
 - **DOCX list item detection doesn't distinguish ordered from bullet.** Emit as `-` regardless. Numbered lists lose their numbering. Minor.
 
 ---

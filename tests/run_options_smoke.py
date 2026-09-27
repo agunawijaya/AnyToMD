@@ -1,9 +1,11 @@
 """Smoke test the token-saving options against dedup_test.pdf.
 
 The fixture has the same 32x32 logo on all 6 pages + 1 unique diagram on page 6.
-Without optimizations: 7 AI calls (6 logos + 1 diagram).
-With dedup only:       2 AI calls (1 logo, cached for the other 5, + 1 diagram).
-With min_dim=64:       1 AI call (logo skipped as tiny, only diagram sent).
+The PDF converter treats an image painted on >=50% of pages as template
+(logo/background) and never sends it — that rule rides on `skip_decorative`,
+which is on by default. So:
+Default options:       1 AI call (logo = template, only the diagram is sent).
+skip_decorative=False: 7 AI calls without dedup, 2 with dedup (logo once + diagram).
 With mode=none:        0 AI calls.
 """
 import io
@@ -45,7 +47,7 @@ def _run(label: str, options: ConvertOptions, ai) -> None:
     out = OUT / f"dedup_test__{tag}.md"
     out.write_text(md, encoding="utf-8")
     stats = options._stats
-    total = sum(stats.values())
+    total = sum(v for k, v in stats.items() if k == "sent" or k.startswith("skipped_"))
     print(f"    stats: {options.stats_summary()}", flush=True)
     print(f"    time: {dur:.1f}s   total_images_processed={total}   output: {out.name}", flush=True)
 
@@ -62,6 +64,8 @@ def main() -> int:
          ConvertOptions(), ai)
     _run("Dedup ON",
          ConvertOptions(image_dedup=True), ai)
+    _run("Dedup ON, template/decorative filter OFF",
+         ConvertOptions(image_dedup=True, skip_decorative=False), ai)
     _run("Skip < 64px",
          ConvertOptions(image_min_dim=64), ai)
     _run("Diagrams-only heuristic",

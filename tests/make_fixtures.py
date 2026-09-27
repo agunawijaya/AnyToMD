@@ -323,6 +323,96 @@ def make_dedup_pdf() -> Path:
     return out
 
 
+def make_slide_deck_pdf() -> Path:
+    """16:9 PDF shaped like a slide deck exported from Impress/PowerPoint.
+
+    Exercises what per-element extraction gets wrong on slides:
+      - a template logo painted on every page (must not be described),
+      - step labels like "1  SOURCE" in small bold text (not headings),
+      - a vector diagram: boxes + connectors with arrowheads, and a legend
+        whose swatch colours say which phase each box belongs to,
+      - a table with no rulings (text aligned in columns only).
+    """
+    teal, purple, grey = (0.12, 0.62, 0.59), (0.46, 0.24, 0.67), (0.55, 0.48, 0.61)
+    logo = Image.new("RGB", (120, 60), (40, 20, 60))
+    ImageDraw.Draw(logo).text((10, 20), "ACME", fill="white", font=_font(22))
+    logo_path = FIX / "_deck_logo.png"
+    logo.save(logo_path)
+
+    doc = fitz.open()
+    doc.set_metadata({"creator": "Impress", "producer": "LibreOffice 24.2",
+                      "title": "Platform rollout"})
+
+    def _frame(page, n: int) -> None:
+        page.insert_image(fitz.Rect(840, 20, 920, 60), filename=str(logo_path))
+        page.insert_text((440, 525), "- Confidential -", fontsize=8, color=(0.5, 0.5, 0.5))
+        page.insert_text((915, 525), f"{n:02d}", fontsize=8, color=(0.5, 0.5, 0.5))
+
+    # 1. Title slide
+    page = doc.new_page(width=960, height=540)
+    _frame(page, 1)
+    page.insert_text((60, 240), "Platform Rollout 2027", fontsize=40)
+    page.insert_text((60, 290), "Phase 1  ·  Architecture  ·  Draft for discussion", fontsize=22)
+
+    # 2. Pipeline diagram with a phase legend
+    page = doc.new_page(width=960, height=540)
+    _frame(page, 2)
+    page.insert_text((40, 40), "THE PIPELINE  ·  PHASE BY PHASE", fontsize=14, color=purple)
+    page.insert_text((40, 85), "From source system to answer", fontsize=28)
+    boxes = [
+        ("1  SOURCE", "Source system", "read-only", teal),
+        ("2  EXTRACT", "Extractor job", "nightly", teal),
+        ("3  INDEX", "Search index", "hybrid ranking", teal),
+        ("4  ANSWER", "Voice agent", "hands-free", purple),
+    ]
+    x = 40
+    for i, (step, title, sub, colour) in enumerate(boxes):
+        rect = fitz.Rect(x, 180, x + 190, 290)
+        shape = page.new_shape()
+        shape.draw_rect(rect)
+        shape.finish(color=colour, fill=(1, 1, 1), width=1.5)
+        shape.commit()
+        page.insert_text((x + 12, 205), step, fontsize=10, fontname="helv")
+        page.insert_text((x + 12, 240), title, fontsize=14, fontname="hebo")
+        page.insert_text((x + 12, 262), sub, fontsize=11)
+        if i < len(boxes) - 1:
+            y = 235
+            shape = page.new_shape()
+            shape.draw_line(fitz.Point(x + 191, y), fitz.Point(x + 222, y))
+            shape.finish(color=grey, width=2, closePath=False)
+            shape.draw_polyline([fitz.Point(x + 221, y - 4), fitz.Point(x + 229, y),
+                                 fitz.Point(x + 221, y + 4)])
+            shape.finish(color=None, fill=grey, closePath=True)
+            shape.commit()
+        x += 230
+    for i, (label, colour) in enumerate([("Phase 1: built now", teal), ("Phase 2", purple)]):
+        sx = 40 + i * 200
+        shape = page.new_shape()
+        shape.draw_rect(fitz.Rect(sx, 400, sx + 22, 414))
+        shape.finish(color=colour, fill=(1, 1, 1), width=1)
+        shape.commit()
+        page.insert_text((sx + 30, 412), label, fontsize=11)
+
+    # 3. Borderless table
+    page = doc.new_page(width=960, height=540)
+    _frame(page, 3)
+    page.insert_text((40, 85), "The stack, layer by layer", fontsize=28)
+    rows = [("LAYER", "TECHNOLOGY", "PHASE"),
+            ("Edge", "Front Door with WAF", "PHASE 1"),
+            ("Database", "PostgreSQL with pgvector", "PHASE 1"),
+            ("Real-time voice", "LiveKit server", "PHASE 2")]
+    for r, row in enumerate(rows):
+        for c, cell in enumerate(row):
+            page.insert_text((40 + c * 300, 150 + r * 40), cell, fontsize=12,
+                             fontname="hebo" if r == 0 or c == 0 else "helv")
+
+    out = FIX / "slide_deck.pdf"
+    doc.save(out)
+    doc.close()
+    logo_path.unlink(missing_ok=True)
+    return out
+
+
 def make_scanned_pdf() -> Path:
     """PDF where every page is an image rendered from text (no extractable text).
 
@@ -526,3 +616,5 @@ if __name__ == "__main__":
     print(f"PDF (scanned):  {p8}")
     p9 = make_sample_html()
     print(f"HTML:           {p9}")
+    p10 = make_slide_deck_pdf()
+    print(f"PDF (slides):   {p10}")

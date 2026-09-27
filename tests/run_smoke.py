@@ -50,6 +50,7 @@ def main() -> int:
 
     _run("IMAGE", FIX / "diagram.png", ai)
     _run("PDF", FIX / "sample.pdf", ai)
+    _run("PDF (slides, text path)", FIX / "slide_deck.pdf", ai)
     _run("PPTX (picture)", FIX / "sample.pptx", ai)
     _run("PPTX (shapes)", FIX / "shape_diagram.pptx", ai)
     _run("DOCX", FIX / "sample.docx", ai)

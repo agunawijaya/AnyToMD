@@ -53,7 +53,10 @@ Both providers implement `AIClient.analyze_image(image_bytes, media_type, extra_
 - Input: raw image bytes (normalized to PNG, max 1568px on longest side).
 - Output: `ImageAnalysis(kind, description, mermaid)`. `mermaid` is `None` if the model didn't produce one, or produced one that failed validation and autofix and retry.
 - `kind` ∈ `{"diagram", "photo", "chart", "screenshot", "illustration", "other"}`.
-- `description` is 2–5 sentences in Bahasa Indonesia. Always populated.
+- `description` is 2–5 sentences in the output language named in the context (PDF: the document's language, see §7), default Bahasa Indonesia. Always populated.
+- `silent=True` (decorative, too small, or a repeat of an image already described) → `to_markdown_block()` returns `""` and converters emit nothing.
+
+**Page transcription contract** (PDF page vision, 2026-09-27): `transcribe_page(png_bytes, text_layer, extra_context) -> PageTranscription(markdown, coverage, retried, invalid_mermaid, input_tokens, output_tokens)`. Implemented by every built-in client; `is_local` tells the converter whether the model is offline (Ollama). See [PDF § Page vision](#pdf).
 
 ## 3. Per-format behavior
 
@@ -66,15 +69,17 @@ Both providers implement `AIClient.analyze_image(image_bytes, media_type, extra_
 **Bullet/unicode normalization** (added 2026-09-21): chars `●•◦▪∙◆❖➤➢➔►★` at line start → `-`. Missing-glyph `?` followed by whitespace + text → `-`. Zero-width chars (`​`, `‌`, `‍`, `﻿`) stripped. Runs of `\s{2,}` collapsed to single space.
 
 **Heading auto-detection** (added 2026-09-21): body font size is the modal size across all blocks (weighted by character count). Per block, heading level is derived from:
-- Explicit numbering `^\d+(\.\d+){0,3}\s+Text` at block start → `##`/`###`/`####` by depth.
+- Explicit numbering `^\d+(\.\d+){0,3}\s+Text` at block start → `##`/`###`/`####` by depth. Not when the number stands alone on the block's first line (a card/list badge: `1\nPlace an order`), and not for a bare integer in text smaller than the body (a step label: `1  CUSTOMER`) — added 2026-09-27.
 - Font size ratio: ≥1.6× body → `##`; ≥1.3× → `###`; ≥1.15× + bold + <80 chars → `####`.
-- PDF outline (`doc.get_toc()`) — if the document has real bookmarks, emitted as `## Title` before body of the anchor page.
+- PDF outline (`doc.get_toc()`) — if the document has real bookmarks, emitted as `## Title` before body of the anchor page. In slide decks, generic titles (`Slide 3`, `Page 3`, `Halaman 3`) are dropped.
 
 **Paragraph merge across blocks** (added 2026-09-21): consecutive prose blocks merge when: same x-indent (±4pt), font size delta < 0.6pt, y-gap < 1.5× body size, previous doesn't end with sentence terminator, next doesn't start with a bullet. Fixes hard-wrapping from PyMuPDF's block splitter cutting mid-sentence.
 
 **Nested bullets** (added 2026-09-21): within a block, distinct bullet-line indent-char counts map to nesting tiers (`- item`, `  - subitem`). Only kicks in when there are ≥2 distinct indent levels with ≥2-char delta. Bullet marker on its own line grabs the next non-empty line as its body.
 
-**Cover/divider page skip** (added 2026-09-21): pages with <20 chars text AND no tables AND no images emit `*(Halaman N: cover/divider — dilewati)*` instead of full-page whitespace noise.
+**Cover/divider page skip** (added 2026-09-21): pages with <20 chars text AND no tables AND no (non-template) images emit `*(Halaman N: cover/divider — dilewati)*` instead of full-page whitespace noise.
+
+**Slide decks** (added 2026-09-27): a PDF is a slide deck when ≥80% of its pages are landscape (ratio >1.2) AND either its creator/producer names Impress, PowerPoint, Keynote or Google Slides, or every page is a screen format (16:9, 16:10, 4:3 ±0.02; A4/Letter landscape don't qualify). Slide decks get `---` between pages and generic outline titles dropped; with page vision (below) they are read page by page.
 
 Text within a block is joined; paragraph breaks (double newline) preserved; soft-wraps merged; de-hyphenation applied (`word-\nfrag` → `wordfrag`).
 
@@ -90,7 +95,7 @@ Body blocks (not in boundary zone, or in boundary zone but not matching the abov
 
 **Tables** (pdfplumber, added 2026-09-21): after opening the PDF with PyMuPDF, we also open it with `pdfplumber` once. Two-pass detection:
 1. **Lines strategy** (primary): `snap_tolerance=4`, `join_tolerance=4`, `edge_min_length=8`. Catches most bordered tables.
-2. **Text-clustering strategy** (fallback per-page, only when lines pass found nothing): stricter validation — max 4 columns, sparsity <30%, no cell >100 chars, each column non-empty in ≥40% of rows. Catches whitespace-aligned tables while rejecting prose.
+2. **Text-clustering strategy** (fallback per-page, only when lines pass found nothing): stricter validation — max 4 columns, sparsity <30%, no cell >100 chars, each column non-empty in ≥40% of rows. Catches whitespace-aligned tables while rejecting prose. When the detected bbox cuts through a word (pdfplumber puts the last column's edge where most rows end, so a longer line loses its tail: `Modernization` → `Modernizat`), the cells are rebuilt from whole words by `_table_from_words`: rows and column starts from pdfplumber, each word to the row of its vertical centre and the last column starting at or before it, and a line that runs past the right edge is followed word by word (gap ≤12pt) — added 2026-09-27. Before this fix the CoverGo benchmark silently lost 129 words (1.3%) inside tables.
 
 Each detected table's `.extract()` output is converted to markdown by `_table_to_markdown` with:
 - **Empty-column collapse**: columns 100%-empty across all rows are dropped.
@@ -100,7 +105,19 @@ Each detected table's `.extract()` output is converted to markdown by `_table_to
 
 For each page, text blocks whose y-midpoint falls inside a table's bbox (±2pt) are dropped from the text stream to avoid duplication; text blocks and tables are then interleaved by y-coordinate so reading order is preserved. If `pdfplumber` is not installed the step is silently skipped.
 
-**Images**: `page.get_images(full=True)` gives xrefs. Each is extracted via `doc.extract_image(xref)`, sent to the AI. Order: all text/tables of a page emitted first (interleaved by y), then all images of that page.
+**Images** (reworked 2026-09-27): only images actually **painted** on the page count — `page.get_image_info(xrefs=True, hashes=True)`, one entry per xref. (`page.get_images()` lists the page's *resources*; slide exports share one resource dictionary, so every page "had" every image of the deck — 742 images for a 14-page deck of which 91 are painted.) An image painted on ≥50% of pages of a ≥3-page document is **template** (logo, background, frame) and is dropped without an AI call (rides on `skip_decorative`, counted as `skipped_template`). The rest are extracted via `doc.extract_image(xref)`, sent to the AI, and emitted **at their y-position** among the page's text and tables. Silent results (decorative, tiny, duplicate) emit nothing.
+
+**Page vision** (added 2026-09-27; `ConvertOptions.pdf_page_vision` / `ANYTOMD_PDF_PAGE_VISION`): each page is rendered (long side 1568 px) and a vision model writes its Markdown, anchored on the page's text layer.
+- Modes: `auto` (default) = slide decks only, only when the client is not local (`is_local=False`: Anthropic/OpenAI/Gemini/Moonshot, or a hybrid whose *diagram* route is cloud), and not when `image_mode="none"`. `always` = every page with content, any provider (Ollama included). `never` = classic extraction only.
+- Pages with <20 chars of text and no non-template image are not sent (cover/divider path). Up to 4 pages run concurrently; PyMuPDF work (render, text layer) happens on the main thread first.
+- **Text layer** sent with the image: one entry per body block (header/footer removed) `[x=0.16 y=0.23] text`, continuation lines indented, plus exact hints read from the PDF's vector drawing (`converters/pdf_vector.py`):
+  - `{legend: X}` — the box around the text is drawn in the colour/border of legend entry X. A legend = ≥2 small text-less swatches (9–40 × 9–30 pt) in different styles, each with a label starting ≤25 pt to its right (read word by word). A swatch matches a box by identical style, else by its colour equalling the box's border or fill (dashed must agree).
+  - `{box Sn}` + a `BOX STYLES` list for boxes that match no legend.
+  - `CONNECTORS` — every open stroked path (≥6 pt) as `"tail box" → "head box"`, direction from a small filled shape (≤14 pt) within 8 pt of an end; ends resolved to the top text of the smallest box (min side 30 pt, 8 pt tolerance) around them; short text (≤24 chars) within 18 pt of the line becomes `(label "I1")`. Lines whose both ends resolve to the same box (rulings, underlines) are dropped.
+- Prompt (`PAGE_SYSTEM`): wording copied exactly from the text layer (capitalisation kept, nothing added); structure from the image; slide title `##`, panels `###`; row-related grids → tables, independent side-by-side panels → `###` sections; boxes+arrows → Mermaid with quoted labels, subgraphs for containment, edges/directions/labels from CONNECTORS; legend categories written next to each item; `> **Figure:**` only for content-bearing pictures.
+- **Checks and one retry** (`_transcribe_page_with_retry`): Mermaid blocks validated + autofixed; `coverage` = share of distinct text-layer words present in the answer; `added_words` = words in the answer found nowhere on the page (outside Figure lines; inside Mermaid only quoted labels). Retry once if coverage <92%, a Mermaid block stays invalid, or >2 distinct added words; the retry prompt lists the missing entries / invented words; the better attempt is kept. A Mermaid block still invalid afterwards is demoted to a plain code fence with a note.
+- **Failure**: an exception on a page (API error, budget cap) → that page goes through classic extraction; counted as `page_vision_fallbacks`.
+- Stats: `page_vision_pages`, `page_vision_retries`, `page_vision_min_coverage`, `page_vision_tokens_in/out` (Anthropic input includes cached system-prompt tokens).
 
 **Encrypted PDFs**: PyMuPDF will raise; the error surfaces in the GUI dialog. No password-prompt UI.
 
@@ -279,7 +296,7 @@ The `OptimizedAIClient` wrapper (in `ai_client.py`) enforces filters in this ord
 4. **Diagram-only** (`image_mode="diagrams_only"`) — run `image_heuristics.looks_like_diagram()`. Passing signals (any one): ≤20 distinct colors, ≥55% near-white pixels, or ≥6% edge density. Tuned to lean toward keeping (false positives waste one AI call; false negatives lose a diagram — the worse failure mode).
 5. **Dedup** (`image_dedup=True`) — SHA-256 of image bytes. First occurrence goes through, result cached; subsequent identical bytes reuse the cached analysis. Cache is per-conversion (fresh cache per file).
 
-Skipped images produce the compact placeholder above instead of the full `> **[Gambar dalam dokumen asli — ...]**` block. Stats (sent / skipped_tiny / skipped_duplicate / skipped_not_diagram / skipped_mode_none) are accumulated on `ConvertOptions._stats` and shown in the GUI status bar after conversion.
+Skipped images produce the compact placeholder above instead of the full `> **[Gambar dalam dokumen asli — ...]**` block — except **silent** skips (2026-09-27): decorative, too small (bytes or px), and duplicates emit nothing at all (a duplicate was already described at its first occurrence). Placeholders remain for choices the user made (`mode: none`, `diagrams_only`) and for the budget cap. Stats (sent / skipped_tiny / skipped_duplicate / skipped_not_diagram / skipped_mode_none / skipped_decorative / skipped_template) are accumulated on `ConvertOptions._stats` and shown in the GUI status bar after conversion.
 
 **Measured impact** on `tests/fixtures/dedup_test.pdf` (6-page PDF with a 32×32 logo repeated on every page + 1 real diagram = 7 image occurrences):
 
@@ -294,8 +311,11 @@ Skipped images produce the compact placeholder above instead of the full `> **[G
 
 *Heuristic didn't reject the logo — logos with limited palette look "diagram-like" to the local classifier. Diagram-only is more useful for filtering photos/screenshots, not logos.
 
+Since 2026-09-27 the logo in this fixture is painted on all 6 pages and is therefore **template** — every configuration with `skip_decorative` on (the default) sends only the diagram (1 call). `tests/run_options_smoke.py` adds a `skip_decorative=False` case to keep exercising dedup (2 calls).
+
 ## 7. Language of output
 
 - Structural markdown (headings, table headers) is not translated — the values come from the source document as-is.
-- AI-generated content (image descriptions) is in **Bahasa Indonesia**, enforced via the system prompt.
+- AI-generated content (image descriptions) is in **Bahasa Indonesia** by default. For PDFs (2026-09-27) the document language is guessed by `anytomd/lang.py` (stopword counts: English / Bahasa Indonesia; Arabic by script share) and passed as `Output language: <lang>` — an English PDF gets English descriptions. PPTX/DOCX still use the default.
+- Page vision copies the page's own words; it adds none (checked, see PDF § Page vision).
 - The Mermaid block itself uses whatever labels the source shows; those labels are extracted from the image and typically match source language.

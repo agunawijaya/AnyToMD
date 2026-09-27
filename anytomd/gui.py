@@ -732,6 +732,11 @@ class OptionsPanel(QWidget):
         ("Auto — hanya page yang tampak scan",        "auto"),
         ("Always — OCR setiap page (paksa)",          "always"),
     ]
+    _PAGE_VISION_LABELS = [
+        ("Auto — PDF slide deck, provider cloud",     "auto"),
+        ("Selalu — setiap halaman (juga Ollama)",     "always"),
+        ("Tidak pernah — ekstraksi teks biasa",       "never"),
+    ]
     _OCR_ENGINE_LABELS = [
         ("Tesseract (offline, ringan)",               "tesseract"),
         ("PaddleOCR (offline, akurat, heavy)",        "paddleocr"),
@@ -808,6 +813,25 @@ class OptionsPanel(QWidget):
 
         row.addWidget(ocr_grp, stretch=1)
 
+        # --- PDF slide deck: AI reads each rendered page ---
+        pv_grp = QGroupBox("PDF slide → AI per halaman")
+        pv_form = QFormLayout(pv_grp)
+        pv_form.setLabelAlignment(Qt.AlignRight)
+        self.page_vision_combo = QComboBox()
+        for label, _val in self._PAGE_VISION_LABELS:
+            self.page_vision_combo.addItem(label)
+        for i, (_lbl, val) in enumerate(self._PAGE_VISION_LABELS):
+            if val == defaults.pdf_page_vision:
+                self.page_vision_combo.setCurrentIndex(i)
+                break
+        self.page_vision_combo.setToolTip(
+            "Diagram, tabel tanpa garis, dan layout kolom di slide yang di-export ke PDF\n"
+            "dibaca AI dari gambar halaman, dengan teks asli PDF sebagai acuan.\n"
+            "Satu panggilan AI per halaman."
+        )
+        pv_form.addRow("Mode:", self.page_vision_combo)
+        row.addWidget(pv_grp, stretch=1)
+
     def collect(self) -> ConvertOptions:
         img_idx = self.mode_combo.currentIndex()
         img_mode = self._IMG_MODE_LABELS[img_idx][1] if 0 <= img_idx < len(self._IMG_MODE_LABELS) else "all"
@@ -820,6 +844,10 @@ class OptionsPanel(QWidget):
 
         ocr_lang = self.ocr_lang_edit.text().strip() or "ind+eng"
 
+        pv_idx = self.page_vision_combo.currentIndex()
+        page_vision = (self._PAGE_VISION_LABELS[pv_idx][1]
+                       if 0 <= pv_idx < len(self._PAGE_VISION_LABELS) else "auto")
+
         return ConvertOptions(
             image_dedup=self.dedup_check.isChecked(),
             image_min_dim=int(self.min_dim_spin.value()),
@@ -828,6 +856,7 @@ class OptionsPanel(QWidget):
             ocr_mode=ocr_mode,  # type: ignore[arg-type]
             ocr_engine=ocr_engine,  # type: ignore[arg-type]
             ocr_lang=ocr_lang,
+            pdf_page_vision=page_vision,  # type: ignore[arg-type]
         )
 
 

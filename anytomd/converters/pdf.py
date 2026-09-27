@@ -9,8 +9,10 @@ from typing import Callable
 
 import fitz  # PyMuPDF
 
-from ..ai_client import AIClient, wrap_with_options
+from ..ai_client import AIClient, format_text_layer_entry, wrap_with_options
+from ..lang import detect_language
 from ..options import ConvertOptions
+from .pdf_vector import TextBlock, page_vector_hints
 
 ProgressFn = Callable[[str], None]
 
@@ -51,6 +53,7 @@ class _Block:
     x0: float = 0.0
     max_font_size: float = 0.0
     is_bold: bool = False
+    x1: float = 0.0
 
 
 # Numbering patterns that reliably signal headings, independent of font size.
@@ -70,6 +73,7 @@ def convert_pdf(path: Path, ai: AIClient, progress: ProgressFn | None = None,
         blocks_per_page, page_heights = _extract_blocks(doc)
         skip_texts = _detect_repeated_boundary_text(blocks_per_page, page_heights)
         tables_by_page = _extract_tables_by_page(path, progress)
+        slide_deck = _is_slide_deck(doc)
         # A6: PDF outline — if the doc has real bookmarks, use them as heading
         # source-of-truth. `pages_with_outline` maps page_idx → list of
         # (level, title) so we can promote them to markdown headings.
@@ -77,6 +81,22 @@ def convert_pdf(path: Path, ai: AIClient, progress: ProgressFn | None = None,
         # A1: derive body font size once — used to promote big-font blocks to
         # markdown headings during per-page emission.
         body_font_size = _detect_body_font_size(blocks_per_page)
+        doc_language = detect_language(
+            "\n".join(b.text for page_blocks in blocks_per_page for b in page_blocks))
+        body_by_page = [
+            _filter_body(blocks_per_page[i], page_heights[i], skip_texts)
+            for i in range(len(doc))
+        ]
+
+        # Only images actually painted on a page count. `page.get_images()`
+        # lists the page's resources, and slide exports share one resource
+        # dictionary across pages (every page "has" every image of the deck).
+        drawn_by_page = [_drawn_images(doc[i]) for i in range(len(doc))]
+        # Images painted on most pages are template: logo, background, frame.
+        template_digests = (
+            _template_image_digests(drawn_by_page)
+            if options is None or options.skip_decorative else set()
+        )
 
         # OCR uses the RAW ai (bypasses image dedup/skip filters — those are
         # for embedded document images, not page renders).
@@ -84,26 +104,48 @@ def convert_pdf(path: Path, ai: AIClient, progress: ProgressFn | None = None,
         # Image analysis uses the WRAPPED ai (respects dedup/skip/mode).
         ai_for_images = wrap_with_options(ai, options) if options else ai
 
+        page_md: dict[int, str] = {}
+        if _use_page_vision(ai, options, slide_deck):
+            page_md = _run_page_vision(
+                doc, ai, body_by_page, drawn_by_page, template_digests,
+                doc_language, progress, options,
+            )
+
         out: list[str] = [f"# {path.stem}", ""]
         for page_idx in range(len(doc)):
-            _emit(progress, f"Page {page_idx + 1}/{len(doc)}: teks")
             page = doc[page_idx]
-            body_blocks = _filter_body(
-                blocks_per_page[page_idx], page_heights[page_idx], skip_texts
-            )
-            tables_here = tables_by_page.get(page_idx, [])
+            if slide_deck and page_idx > 0:
+                out.extend(["---", ""])
 
             # Emit any outline headings anchored at this page BEFORE content.
             for level, title in outline_by_page.get(page_idx, []):
+                if slide_deck and _GENERIC_OUTLINE_RE.match(title):
+                    continue  # "Slide 3" says nothing the page doesn't
                 hashes = "#" * min(level + 1, 6)  # PDF level 1 → ##
                 out.append(f"{hashes} {title}")
                 out.append("")
+
+            if page_idx in page_md:
+                out.append(page_md[page_idx])
+                out.append("")
+                continue
+
+            _emit(progress, f"Page {page_idx + 1}/{len(doc)}: teks")
+            body_blocks = body_by_page[page_idx]
+            tables_here = tables_by_page.get(page_idx, [])
+            images_here = drawn_by_page[page_idx]
+            if template_digests:
+                n_template = sum(1 for im in images_here if im.digest in template_digests)
+                if n_template and options is not None:
+                    options._stats["skipped_template"] = (
+                        options._stats.get("skipped_template", 0) + n_template)
+                images_here = [im for im in images_here if im.digest not in template_digests]
 
             # A7: Skip cover/divider pages
             text_len = sum(len(b.text) for b in body_blocks)
             if (text_len < _COVER_TEXT_CUTOFF
                     and not tables_here
-                    and not page.get_images(full=True)):
+                    and not images_here):
                 out.append(f"*(Halaman {page_idx + 1}: cover/divider — dilewati)*")
                 out.append("")
                 continue
@@ -150,44 +192,184 @@ def convert_pdf(path: Path, ai: AIClient, progress: ProgressFn | None = None,
                         items.append((b.y0, cleaned))
             for tbl in tables_here:
                 items.append((tbl.bbox[1], tbl.markdown))
-            items.sort(key=lambda x: x[0])
-            for _y, content in items:
-                out.append(content)
-                out.append("")
 
-            image_infos = page.get_images(full=True)
-            for img_idx, info in enumerate(image_infos, start=1):
-                xref = info[0]
-                _emit(progress, f"Page {page_idx + 1}: gambar {img_idx}/{len(image_infos)}")
+            # Images go where they sit on the page, between the text around them.
+            for img_idx, im in enumerate(images_here, start=1):
+                _emit(progress, f"Page {page_idx + 1}: gambar {img_idx}/{len(images_here)}")
                 try:
-                    img_bytes, media = _extract_image(doc, xref)
+                    img_bytes, media = _extract_image(doc, im.xref)
                 except Exception as e:
-                    out.append(f"> *[Gagal mengekstrak gambar {img_idx} halaman {page_idx + 1}: {e}]*")
-                    out.append("")
+                    items.append((im.y0, f"> *[Gagal mengekstrak gambar {img_idx} halaman {page_idx + 1}: {e}]*"))
                     continue
                 try:
                     analysis = ai_for_images.analyze_image(
                         img_bytes,
                         media_type=media,
-                        extra_context=f"Gambar ini dari halaman {page_idx + 1} sebuah PDF.",
+                        extra_context=(f"Gambar ini dari halaman {page_idx + 1} sebuah PDF. "
+                                       f"Output language: {doc_language}."),
                     )
                 except Exception as e:
-                    out.append(f"> *[Gagal menganalisis gambar {img_idx} halaman {page_idx + 1}: {e}]*")
-                    out.append("")
+                    items.append((im.y0, f"> *[Gagal menganalisis gambar {img_idx} halaman {page_idx + 1}: {e}]*"))
                     continue
                 block = analysis.to_markdown_block(alt_hint=f"page{page_idx + 1}_img{img_idx}")
+                if not block:
+                    continue
                 # D1: if AI classified this as a screenshot AND OCR is enabled
                 # (or Tesseract is available), extract the on-screen text so
                 # users can search/grep it. Free vs. paying for another AI call.
                 extra = _ocr_screenshot_if_possible(analysis.kind, img_bytes, options)
                 if extra:
                     block += "\n\n**Teks di dalam gambar (OCR):**\n\n" + extra
-                out.append(block)
+                items.append((im.y0, block))
+
+            items.sort(key=lambda x: x[0])
+            for _y, content in items:
+                out.append(content)
                 out.append("")
 
         return "\n".join(out).rstrip() + "\n"
     finally:
         doc.close()
+
+
+# ---------- Slide decks and page vision ----------
+
+# Apps whose PDF export is a slide deck. Matched against creator/producer.
+_SLIDE_APPS = ("impress", "powerpoint", "keynote", "google slides")
+# Screen formats. A4/Letter landscape (1.41/1.29) are deliberately absent.
+_SLIDE_RATIOS = (16 / 9, 16 / 10, 4 / 3)
+_GENERIC_OUTLINE_RE = re.compile(r"^(?:slide|page|halaman|folie|diapositiva|dia)\s*\d+$",
+                                 re.IGNORECASE)
+# A page image is template when it is painted on at least this share of pages.
+_TEMPLATE_IMAGE_SHARE = 0.5
+_TEMPLATE_MIN_PAGES = 3
+_PAGE_RENDER_LONG_SIDE = 1568  # px; vision models downscale anything larger
+_PAGE_VISION_WORKERS = 4
+
+
+@dataclass
+class _DrawnImage:
+    xref: int
+    y0: float
+    digest: bytes
+
+
+def _is_slide_deck(doc: fitz.Document) -> bool:
+    n = len(doc)
+    if n == 0:
+        return False
+    ratios = [p.rect.width / p.rect.height for p in doc if p.rect.height > 0]
+    if sum(1 for r in ratios if r > 1.2) / n < 0.8:
+        return False
+    meta = doc.metadata or {}
+    app = f"{meta.get('creator') or ''} {meta.get('producer') or ''}".lower()
+    if any(name in app for name in _SLIDE_APPS):
+        return True
+    return all(any(abs(r - t) < 0.02 for t in _SLIDE_RATIOS) for r in ratios)
+
+
+def _drawn_images(page: fitz.Page) -> list[_DrawnImage]:
+    """Images actually painted on `page`, top to bottom, one entry per xref."""
+    try:
+        infos = page.get_image_info(hashes=True, xrefs=True)
+    except Exception:
+        return []
+    seen: set[int] = set()
+    out: list[_DrawnImage] = []
+    for info in sorted(infos, key=lambda i: (i["bbox"][1], i["bbox"][0])):
+        xref = info.get("xref") or 0
+        if xref <= 0 or xref in seen:  # 0 = inline image, not extractable by xref
+            continue
+        seen.add(xref)
+        out.append(_DrawnImage(xref=xref, y0=float(info["bbox"][1]),
+                               digest=info.get("digest") or str(xref).encode()))
+    return out
+
+
+def _template_image_digests(drawn_by_page: list[list[_DrawnImage]]) -> set[bytes]:
+    n = len(drawn_by_page)
+    if n < _TEMPLATE_MIN_PAGES:
+        return set()
+    counts: Counter[bytes] = Counter()
+    for images in drawn_by_page:
+        counts.update({im.digest for im in images})
+    return {d for d, c in counts.items() if c / n >= _TEMPLATE_IMAGE_SHARE}
+
+
+def _use_page_vision(ai: AIClient, options: ConvertOptions | None, slide_deck: bool) -> bool:
+    if not hasattr(ai, "transcribe_page"):
+        return False
+    mode = options.pdf_page_vision if options is not None else "auto"
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if options is not None and options.image_mode == "none":
+        return False  # the user asked for a conversion without AI images
+    # Small local models misread dense slides; keep auto for cloud models.
+    return slide_deck and not getattr(ai, "is_local", True)
+
+
+def _run_page_vision(doc: fitz.Document, ai: AIClient, body_by_page: list[list[_Block]],
+                     drawn_by_page: list[list[_DrawnImage]], template_digests: set[bytes],
+                     language: str, progress: ProgressFn | None,
+                     options: ConvertOptions | None) -> dict[int, str]:
+    """Transcribe pages with a vision model, several at a time.
+
+    Returns {page_idx: markdown}. Pages left out (empty, or the AI call
+    failed) go through the classic extraction path.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    n = len(doc)
+    jobs: dict[int, tuple[bytes, str]] = {}
+    # PyMuPDF is not thread-safe: render and build text layers up front.
+    for idx in range(n):
+        body = body_by_page[idx]
+        meaningful_images = [im for im in drawn_by_page[idx] if im.digest not in template_digests]
+        if sum(len(b.text) for b in body) < _COVER_TEXT_CUTOFF and not meaningful_images:
+            continue
+        page = doc[idx]
+        zoom = _PAGE_RENDER_LONG_SIDE / max(page.rect.width, page.rect.height)
+        png = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom)).tobytes("png")
+        w, h = page.rect.width or 1, page.rect.height or 1
+        hints = page_vector_hints(page, [TextBlock(b.x0, b.y0, b.x1, b.y1, b.text) for b in body])
+        layer = "\n".join(format_text_layer_entry(b.x0 / w, b.y0 / h, b.text) + tag
+                          for b, tag in zip(body, hints.tags))
+        if hints.appendix:
+            layer += "\n\n" + hints.appendix
+        jobs[idx] = (png, layer)
+
+    def _one(idx: int):
+        png, layer = jobs[idx]
+        ctx = f"Page {idx + 1} of {n}. Document language: {language}."
+        return ai.transcribe_page(png, layer, ctx)
+
+    results: dict[int, str] = {}
+    stats = options._stats if options is not None else None
+    _emit(progress, f"AI per halaman: {len(jobs)} dari {n} halaman")
+    with ThreadPoolExecutor(max_workers=_PAGE_VISION_WORKERS) as pool:
+        futures = {idx: pool.submit(_one, idx) for idx in sorted(jobs)}
+        for idx, fut in futures.items():
+            try:
+                tr = fut.result()
+            except Exception as e:
+                _emit(progress, f"Page {idx + 1}/{n}: AI per halaman gagal ({e}) — ekstraksi teks")
+                if stats is not None:
+                    stats["page_vision_fallbacks"] = stats.get("page_vision_fallbacks", 0) + 1
+                continue
+            _emit(progress, f"Page {idx + 1}/{n}: AI per halaman "
+                            f"(cakupan teks {tr.coverage:.0%}{', diulang' if tr.retried else ''})")
+            results[idx] = tr.markdown.strip()
+            if stats is not None:
+                stats["page_vision_pages"] = stats.get("page_vision_pages", 0) + 1
+                stats["page_vision_retries"] = stats.get("page_vision_retries", 0) + int(tr.retried)
+                stats["page_vision_min_coverage"] = min(
+                    stats.get("page_vision_min_coverage", 1.0), tr.coverage)
+                stats["page_vision_tokens_in"] = stats.get("page_vision_tokens_in", 0) + tr.input_tokens
+                stats["page_vision_tokens_out"] = (stats.get("page_vision_tokens_out", 0)
+                                                   + tr.output_tokens)
+    return results
 
 
 # ---------- Table extraction (pdfplumber) ----------
@@ -247,9 +429,16 @@ def _extract_tables_by_page(
                         found_text = page.find_tables(table_settings=text_settings)
                     except Exception:
                         found_text = []
+                    words = page.extract_words() if found_text else []
                     for tbl in found_text:
                         try:
-                            data = tbl.extract()
+                            # Text-clustered edges can cut through a word
+                            # ("Modernization" → "Modernizat"); rebuild the
+                            # cells from whole words instead.
+                            if _bbox_clips_words(tbl.bbox, words):
+                                data = _table_from_words(tbl, words)
+                            else:
+                                data = tbl.extract()
                         except Exception:
                             continue
                         md = _table_to_markdown(data, strict=True)
@@ -261,6 +450,56 @@ def _extract_tables_by_page(
         _emit(progress, f"pdfplumber gagal: {e}")
         return {}
     return result
+
+
+def _bbox_clips_words(bbox, words: list[dict], tol: float = 1.0) -> bool:
+    """True if a word straddles the edge of `bbox` (partly in, partly out)."""
+    x0, top, x1, bottom = bbox
+    for w in words:
+        overlaps = (w["x0"] < x1 - tol and w["x1"] > x0 + tol
+                    and w["top"] < bottom - tol and w["bottom"] > top + tol)
+        inside = (w["x0"] >= x0 - tol and w["x1"] <= x1 + tol
+                  and w["top"] >= top - tol and w["bottom"] <= bottom + tol)
+        if overlaps and not inside:
+            return True
+    return False
+
+
+def _table_from_words(tbl, words: list[dict], line_tol: float = 2.0,
+                      word_gap: float = 12.0) -> list[list[str]]:
+    """Cells of a text-strategy table, filled with whole words.
+
+    Rows and column starts come from pdfplumber. Every word inside the table
+    goes to the row holding its vertical centre and the last column starting
+    at or before it. A line that runs past the table's right edge is followed
+    word by word (gaps up to `word_gap`) so its tail stays in the last cell.
+    """
+    x0, top, x1, bottom = tbl.bbox
+    row_bands = sorted((r.bbox[1], r.bbox[3]) for r in tbl.rows)
+    col_starts = sorted(c.bbox[0] for c in tbl.columns)
+    if not row_bands or not col_starts:
+        return []
+
+    def _mid_y(w):
+        return (w["top"] + w["bottom"]) / 2
+
+    band = [w for w in words if top - line_tol <= _mid_y(w) <= bottom + line_tol]
+    taken = [w for w in band if w["x1"] > x0 and w["x0"] < x1]
+    # Follow each line past the right edge.
+    for w in sorted(band, key=lambda w: w["x0"]):
+        if w["x0"] >= x1 and any(abs(w["top"] - t["top"]) <= line_tol
+                                 and 0 <= w["x0"] - t["x1"] <= word_gap for t in taken):
+            taken.append(w)
+
+    cells = [["" for _ in col_starts] for _ in row_bands]
+    for w in sorted(taken, key=lambda w: (round(w["top"]), w["x0"])):
+        y = _mid_y(w)
+        r = min(range(len(row_bands)),
+                key=lambda i: 0 if row_bands[i][0] <= y <= row_bands[i][1]
+                else min(abs(y - row_bands[i][0]), abs(y - row_bands[i][1])))
+        c = max([i for i, s in enumerate(col_starts) if s <= w["x0"] + line_tol] or [0])
+        cells[r][c] = (cells[r][c] + " " + w["text"]).strip()
+    return cells
 
 
 def _merge_disjoint_columns(padded: list[list[str]], ncols: int) -> tuple[list[list[str]], int]:
@@ -472,7 +711,7 @@ def _extract_blocks(doc: fitz.Document) -> tuple[list[list[_Block]], list[float]
             if blk.get("type") != 0:  # 0 = text
                 continue
             bbox = blk.get("bbox") or (0, 0, 0, 0)
-            x0, y0, _x1, y1 = bbox
+            x0, y0, x1, y1 = bbox
             # Collect spans across all lines in the block
             texts: list[str] = []
             max_size = 0.0
@@ -508,6 +747,7 @@ def _extract_blocks(doc: fitz.Document) -> tuple[list[list[_Block]], list[float]
                 x0=float(x0),
                 max_font_size=max_size,
                 is_bold=(bold_char_count / max(1, total_char_count)) >= 0.6,
+                x1=float(x1),
             ))
         blocks.sort(key=lambda b: (b.y0, b.x0))
         per_page.append(blocks)
@@ -546,6 +786,7 @@ def _merge_paragraph_blocks(blocks: list[_Block], body_size: float) -> list[_Blo
             x0=min(prev.x0, cur.x0),
             max_font_size=max(prev.max_font_size, cur.max_font_size),
             is_bold=prev.is_bold and cur.is_bold,
+            x1=max(prev.x1, cur.x1),
         )
     return out
 
@@ -610,6 +851,14 @@ def _classify_heading_level(block: _Block, body_size: float) -> int:
     depth = numbering.count(".") if numbering else -1
 
     size_ratio = block.max_font_size / body_size if body_size > 0 else 1.0
+
+    # A number alone on its first line is a badge on a card or list item
+    # ("1\nPlace an order"), and a bare integer in text smaller than
+    # the body is a step label ("1  CUSTOMER") — neither is a section heading.
+    if numbering:
+        first_line = text.split("\n", 1)[0].strip().rstrip(".)")
+        if first_line == numbering or (depth == 0 and size_ratio < 1.0):
+            numbering = ""
 
     # Explicit numbering wins
     if numbering and (block.is_bold or size_ratio >= 1.05):

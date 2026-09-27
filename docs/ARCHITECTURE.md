@@ -21,7 +21,8 @@ flowchart TB
     end
 
     subgraph CONV[Format converters]
-        PDF[pdf.py<br/>PyMuPDF + pdfplumber<br/>heading/paragraph/list]
+        PDF[pdf.py<br/>PyMuPDF + pdfplumber<br/>heading/paragraph/list<br/>+ page vision for slide decks]
+        PDFV[pdf_vector.py<br/>legend colours + connectors<br/>from the vector drawing]
         PPTX[pptx.py]
         PPTXM[pptx_shape_mermaid.py<br/>XML → Mermaid direct]
         DOCX[docx.py]
@@ -34,6 +35,7 @@ flowchart TB
         RENDER[slide_render.py<br/>PIL rasterizer]
         HEUR[image_heuristics.py<br/>decorative + kind classifier]
         OCR[ocr.py<br/>Tesseract/Paddle/AI/Hybrid]
+        LANG[lang.py<br/>document language guess]
     end
 
     subgraph AICLI[AI clients]
@@ -115,13 +117,15 @@ flowchart TB
 | `anytomd/gui.py`                          | PySide6 UI: `MainWindow` (menubar + toolbar + hero + splitter + status bar), `SettingsDialog` (5 tabs), `ProviderPanel` (currently unused in main; retained for possible future embed), `ApiKeyDialog`, `_KeyRow`, `ConvertWorker`, `OptionsPanel`. Global QSS at module top. |
 | `anytomd/config.py`                       | Loads `.env` from project root, then keyring, then env vars. Exposes `Config` dataclass with per-provider fields (Anthropic, OpenAI, Gemini, Moonshot, Ollama). `provider_for_kind()` implements hybrid routing lookup. `key_source()` returns `"env"`/`"keyring"`/`"missing"` for GUI display. `cost_per_call()` returns cost estimate per provider. |
 | `anytomd/keystore.py`                     | Thin `keyring` wrapper: `get_key/set_key/delete_key/backend_name`. Uses OS-native store (Windows Credential Manager on Windows via DPAPI). Graceful degradation if no backend. |
-| `anytomd/ai_client.py`                    | 5 provider clients: `AnthropicClient`, `OpenAIClient`, `MoonshotClient(OpenAIClient)`, `GeminiClient`, `OllamaClient`. `HybridAIClient` classifies per image (local heuristic) → routes → tracks cost per provider → falls back on error. `OptimizedAIClient` wraps for dedup + skip-tiny + decorative filter + full-skip mode. Mermaid parse/validate/autofix/retry pipeline shared by all providers. |
-| `anytomd/options.py`                      | `ConvertOptions` dataclass: image filters, decorative skip, OCR mode/engine/lang. `_stats` dict accumulates counters + est_cost_usd for GUI status bar. |
+| `anytomd/ai_client.py`                    | 5 provider clients: `AnthropicClient`, `OpenAIClient`, `MoonshotClient(OpenAIClient)`, `GeminiClient`, `OllamaClient`, each with `analyze_image` (describe) and `transcribe_page` (page vision) over one `_complete(png, system, user_text, max_tokens)`; `is_local` marks Ollama. `HybridAIClient` classifies per image (local heuristic) → routes → tracks cost per provider → falls back on error; page vision follows the *diagram* route. `OptimizedAIClient` wraps for dedup + skip-tiny + decorative filter + full-skip mode; filtered results are `silent`. Mermaid parse/validate/autofix/retry pipeline shared by all providers. Page vision: `PAGE_SYSTEM` prompt, `format_text_layer_entry`, `page_coverage`, `added_words`, `_transcribe_page_with_retry`. |
+| `anytomd/options.py`                      | `ConvertOptions` dataclass: image filters, decorative skip, OCR mode/engine/lang, `pdf_page_vision`. `_stats` dict accumulates counters + est_cost_usd + page-vision coverage/tokens for GUI status bar. |
+| `anytomd/lang.py`                         | `detect_language(text)` — English / Bahasa Indonesia by stopword counts, Arabic by script share. Used to ask for image descriptions in the document's language. |
 | `anytomd/image_heuristics.py`             | Zero-cost local classifiers: `is_decorative()` (solid blobs), `looks_like_diagram()` (diagram-only prefilter), `classify_image()` (returns `decorative`/`photo`/`chart`/`screenshot`/`diagram`/`unknown` for hybrid routing). |
 | `anytomd/slide_render.py`                 | PIL rasterizer for PPTX native shapes — fallback when direct XML extraction can't recover the graph. |
 | `anytomd/ocr.py`                          | 4 OCR backends: Tesseract, PaddleOCR (optional heavy), AI Vision (reuses provider), Hybrid (Tesseract → AI fallback). |
 | `anytomd/converters/__init__.py`          | Dispatcher: extension → `convert_*` function. Wraps `ai` with `OptimizedAIClient` per-conversion. |
-| `anytomd/converters/pdf.py`               | PyMuPDF `get_text("dict")` for spans+fonts. pdfplumber tables with column-collapse + disjoint-merge + text-strategy fallback. Heading detection via font-size clustering + numbering regex. Paragraph merge across blocks. Nested bullets from x-indent. Cover-page skip. PDF outline passthrough. Screenshot OCR via `_ocr_screenshot_if_possible`. |
+| `anytomd/converters/pdf.py`               | PyMuPDF `get_text("dict")` for spans+fonts. pdfplumber tables with column-collapse + disjoint-merge + text-strategy fallback (whole-word cells via `_table_from_words` when the bbox cuts words). Heading detection via font-size clustering + numbering regex. Paragraph merge across blocks. Nested bullets from x-indent. Cover-page skip. PDF outline passthrough. Painted-only images (`_drawn_images`), template-image skip, images placed by y. Screenshot OCR via `_ocr_screenshot_if_possible`. Slide-deck detection (`_is_slide_deck`) and page vision (`_use_page_vision`, `_run_page_vision`: render + text layer + vector hints, 4 pages in parallel, per-page fallback). |
+| `anytomd/converters/pdf_vector.py`        | Reads the page's vector drawing for page vision: boxes (style = border colour, fill, dashed), legend swatches with their labels, connectors with arrowheads and badge labels. Returns per-text-block tags (`{legend: X}` / `{box Sn}`) and a BOX STYLES + CONNECTORS appendix. |
 | `anytomd/converters/pptx.py`              | Slide walk. Native chart → markdown table. Speaker notes. Author Alt Text passthrough. Shape-diagram branch: first tries `pptx_shape_mermaid.try_extract_mermaid` (direct XML), falls back to raster+VLM. |
 | `anytomd/converters/pptx_shape_mermaid.py`| E1: enumerate auto-shapes → nodes, LINE connectors → edges, textbox labels near midpoints → edge labels. Returns Mermaid `flowchart LR/TD` or `None` (caller falls back to raster). |
 | `anytomd/converters/docx.py`              | python-docx body walk (paragraphs + tables interleaved); heading/list detection; inline image extraction. |
@@ -315,6 +319,26 @@ flowchart TD
     W -->|yes + Tesseract avail| X[Tesseract OCR<br/>append fenced text block]
     W -->|no| R
     X --> R
+```
+
+### Page vision (slide decks, 2026-09-27)
+
+Decided once per document by `_use_page_vision` (mode `auto`: slide deck + non-local client + `image_mode != none`; `always`; `never`). Pages it transcribes skip the per-page loop above; the rest (empty pages, API failures) go through it unchanged.
+
+```mermaid
+flowchart TD
+    A[slide deck + cloud client] --> B[per page with content:<br/>render 1568 px PNG]
+    A --> C[body blocks<br/>header/footer removed]
+    C --> D[pdf_vector.page_vector_hints<br/>legend tag per box, connectors]
+    D --> E["text layer<br/>[x y] text {legend: X}<br/>+ BOX STYLES + CONNECTORS"]
+    B --> F[ai.transcribe_page<br/>4 pages in parallel]
+    E --> F
+    F --> G{checks:<br/>coverage ≥ 92%?<br/>Mermaid valid?<br/>≤ 2 invented words?}
+    G -->|no| H[one retry listing<br/>missing entries / errors]
+    H --> I[keep better attempt<br/>demote invalid Mermaid]
+    G -->|yes| I
+    F -->|exception| J[fallback: classic<br/>per-page extraction]
+    I --> K[emit page Markdown<br/>--- between slides]
 ```
 
 ## GUI structure

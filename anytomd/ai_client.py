@@ -14,7 +14,8 @@ ImageKind = Literal["diagram", "photo", "chart", "screenshot", "illustration", "
 
 DESCRIBE_SYSTEM = (
     "You analyze images extracted from documents (PDF, PPTX) or standalone image files. "
-    "Your job: (1) classify the image, (2) produce a concise factual description in Bahasa Indonesia, "
+    "Your job: (1) classify the image, (2) produce a concise factual description in the output "
+    "language named in the context (default: Bahasa Indonesia), "
     "(3) if it's a diagram/flowchart/graph/architecture with clear nodes and connections, generate valid "
     "Mermaid syntax that reproduces it.\n\n"
     "Rules for Mermaid:\n"
@@ -42,7 +43,7 @@ DESCRIBE_SYSTEM = (
     "Output STRICT format (three sections separated by lines containing only `---`):\n"
     "KIND: <one of: diagram, photo, chart, screenshot, illustration, other>\n"
     "---\n"
-    "DESCRIPTION: <2-5 sentences in Bahasa Indonesia describing what the image shows>\n"
+    "DESCRIPTION: <2-5 sentences in the output language describing what the image shows>\n"
     "---\n"
     "MERMAID: <mermaid source, or the literal word NONE>"
 )
@@ -59,6 +60,80 @@ RETRY_HINT_TEMPLATE = (
     "(3) never put a space between a node id and its label bracket."
 )
 
+# Page vision: one rendered page (typically a slide exported to PDF) + its
+# text layer → Markdown. The text layer pins the wording; the image supplies
+# the structure (tables without rulings, vector diagrams, reading order).
+PAGE_SYSTEM = (
+    "You convert ONE page of a presentation-style PDF (usually a slide) into clean "
+    "GitHub-flavored Markdown.\n\n"
+    "You receive (1) an image of the rendered page and (2) the page's TEXT LAYER extracted "
+    "from the PDF: one entry per text block, prefixed with its position as fractions of the "
+    "page width (x) and height (y); continuation lines of a block are indented. The tags "
+    "below come straight from the PDF drawing and are exact:\n"
+    "- `{legend: X}` at the end of an entry: the box around this text is drawn in the "
+    "colour/border of legend entry X. Use X as the item's category (e.g. its phase).\n"
+    "- `{box Sn}` at the end of an entry: the box around this text has style Sn, listed under "
+    "BOX STYLES after the entries.\n"
+    "- CONNECTORS, after the entries, lists every arrow or line drawn on the page, "
+    "tail → head, by the text of the boxes at its ends, with the short text sitting on the "
+    "connector as `label`. Take edges, arrow directions and edge labels from it, not from "
+    "your reading of the image.\n"
+    "The tags themselves never appear in your output.\n\n"
+    "Wording:\n"
+    "- Copy wording from the text layer exactly, keeping its capitalisation. Do not "
+    "paraphrase, translate, summarize, correct, or add words. Every text-layer entry must "
+    "appear in your output.\n"
+    "- Never add content that is not on the page: no invented legends, captions, "
+    "explanations, summaries or colour names.\n"
+    "- Take STRUCTURE from the image: reading order, grouping, which label belongs to which "
+    "box, table rows and columns, arrows.\n\n"
+    "Structure:\n"
+    "- Slide title → `## `. Panel or section titles inside the slide → `### `. Never use `#`. "
+    "A small kicker label above the title → an italic line directly under the `##` title.\n"
+    "- Anything laid out as rows × columns, with or without borders, whose cells in a row "
+    "belong together (a row label, or aligned attributes of one item) → a Markdown table with "
+    "every row and every column. Join a label that wraps across lines into one cell. Leave a "
+    "cell empty where the slide has nothing. If the slide has no header row, use an empty one.\n"
+    "- Side-by-side panels, cards or columns that are independent of each other (lists or "
+    "short texts that merely sit next to each other) → one `###` section per panel, left to "
+    "right, each with its own list or paragraph. Not a table.\n"
+    "- Boxes connected by arrows or lines (flowchart, pipeline, journey, architecture with "
+    "connections) → a ```mermaid block. Use `flowchart LR` or `flowchart TB` to match the "
+    "layout. Node ids are short bare words (n1, n2, ...). Put EVERY label in double quotes: "
+    "n1[\"Title<br/>sub-label\"]. Inside a label: join text that merely wraps onto one line, "
+    "use `<br/>` only between a box's title and its smaller sub-label, no Markdown (`**`), no "
+    "`\\n`, no `\"`. Boxes inside a panel go in `subgraph g1[\"Panel title\"] ... end` — "
+    "containment is a subgraph, never an edge. Draw ONLY the arrows and lines visible in the "
+    "image, each pointing the way its arrowhead points; an arrow that ends on a panel border "
+    "targets the subgraph. Edge labels: n1 -- \"label\" --> n2.\n"
+    "- A grid of boxes WITHOUT arrows where colour or border style marks a category from a "
+    "legend (e.g. layers × phases) → a Markdown table with one row per row label and one "
+    "column per legend category; each cell lists that row's boxes of that category, "
+    "separated by `; `.\n"
+    "- Colour that carries meaning given ON THE PAGE (a legend entry via `{legend: X}`, or a "
+    "highlighted option the page recommends) → write that meaning next to each item it applies "
+    "to, e.g. `(Phase 1)` or `(recommended)`, inside Mermaid labels too. A legend drawn on the "
+    "page → one line `**Legend:** <its own labels>`.\n"
+    "- Numbered cards or steps → a numbered list. Bullets → `-` lists, nested by indentation.\n"
+    "- A call-out bar of the form `LABEL  sentence` → `**Label:** sentence`.\n"
+    "- A photo, illustration, or screenshot that carries content → one line `> **Figure:** "
+    "<short description in the language of the page>`. Never use Figure lines for shapes, "
+    "boxes or arrows (those are the diagram) or for logos, icons, decorative shapes and "
+    "backgrounds (ignore them).\n"
+    "- Ignore page numbers and running footers such as 'Confidential'.\n\n"
+    "Output only the Markdown for this page: no preamble, no closing remarks, no code fence "
+    "around the whole answer."
+)
+
+PAGE_RETRY_TEMPLATE = (
+    "Your previous answer for this page had problems:\n{problems}\n\n"
+    "Produce the full Markdown for the page again, following every rule, and fix these problems."
+)
+
+# Rough multiplier over the per-image cost estimate for one page-vision call
+# (bigger prompt with the text layer, several times more output tokens).
+PAGE_COST_FACTOR = 4.0
+
 
 @dataclass
 class ImageAnalysis:
@@ -67,8 +142,13 @@ class ImageAnalysis:
     mermaid: str | None
     skipped: bool = False
     skip_reason: str = ""
+    # Silent results (decorative, tiny, repeated) produce no Markdown at all —
+    # a placeholder per logo/background only buries the real content.
+    silent: bool = False
 
     def to_markdown_block(self, alt_hint: str = "image") -> str:
+        if self.silent:
+            return ""
         if self.skipped:
             return f"> *[Gambar dilewati ({self.skip_reason}) — {alt_hint}]*"
         parts = [
@@ -82,9 +162,19 @@ class ImageAnalysis:
         return "\n".join(parts)
 
     @classmethod
-    def skipped_result(cls, reason: str) -> "ImageAnalysis":
+    def skipped_result(cls, reason: str, silent: bool = False) -> "ImageAnalysis":
         return cls(kind="other", description="", mermaid=None,
-                   skipped=True, skip_reason=reason)
+                   skipped=True, skip_reason=reason, silent=silent)
+
+
+@dataclass
+class PageTranscription:
+    markdown: str
+    coverage: float           # share of distinct text-layer words present in the output
+    retried: bool = False
+    invalid_mermaid: int = 0  # blocks demoted to plain code fences
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class AIClient(Protocol):
@@ -92,9 +182,16 @@ class AIClient(Protocol):
                       extra_context: str = "") -> ImageAnalysis: ...
 
 
+# Optional capability, implemented by every built-in client:
+#   transcribe_page(png_bytes, text_layer, extra_context="") -> PageTranscription
+#   is_local: bool   (True = offline model; page vision stays opt-in for those)
+
+
 # ---------- Anthropic ----------
 
 class AnthropicClient:
+    is_local = False
+
     def __init__(self, config: Config):
         if not config.api_key:
             raise RuntimeError("ANTHROPIC_API_KEY tidak ada. Set di .env.")
@@ -107,18 +204,24 @@ class AnthropicClient:
         png_bytes = _normalize_image(image_bytes)
         return _analyze_with_retry(self._call, png_bytes, extra_context)
 
-    def _call(self, png_bytes: bytes, extra_context: str) -> str:
-        b64 = base64.standard_b64encode(png_bytes).decode("ascii")
-        user_text = "Analisis gambar berikut sesuai instruksi sistem."
-        if extra_context:
-            user_text += f"\n\nKonteks tambahan: {extra_context}"
+    def transcribe_page(self, png_bytes: bytes, text_layer: str,
+                        extra_context: str = "") -> PageTranscription:
+        return _transcribe_page_with_retry(self._complete, _normalize_image(png_bytes),
+                                           text_layer, extra_context)
 
+    def _call(self, png_bytes: bytes, extra_context: str) -> str:
+        return self._complete(png_bytes, DESCRIBE_SYSTEM, _describe_user_text(extra_context),
+                              2048)[0]
+
+    def _complete(self, png_bytes: bytes, system: str, user_text: str,
+                  max_tokens: int) -> tuple[str, int, int]:
+        b64 = base64.standard_b64encode(png_bytes).decode("ascii")
         resp = self.client.messages.create(
             model=self.model,
-            max_tokens=2048,
+            max_tokens=max_tokens,
             system=[{
                 "type": "text",
-                "text": DESCRIBE_SYSTEM,
+                "text": system,
                 "cache_control": {"type": "ephemeral"},
             }],
             messages=[{
@@ -132,12 +235,19 @@ class AnthropicClient:
                 ],
             }],
         )
-        return "".join(block.text for block in resp.content if block.type == "text")
+        text = "".join(block.text for block in resp.content if block.type == "text")
+        usage = getattr(resp, "usage", None)
+        # input_tokens excludes the cached system prompt; count it too.
+        tokens_in = sum(int(getattr(usage, k, 0) or 0) for k in
+                        ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        return text, tokens_in, int(getattr(usage, "output_tokens", 0) or 0)
 
 
 # ---------- Ollama ----------
 
 class OllamaClient:
+    is_local = True
+
     def __init__(self, config: Config):
         try:
             import ollama  # deferred import
@@ -154,18 +264,30 @@ class OllamaClient:
         png_bytes = _normalize_image(image_bytes)
         return _analyze_with_retry(self._call, png_bytes, extra_context)
 
+    def transcribe_page(self, png_bytes: bytes, text_layer: str,
+                        extra_context: str = "") -> PageTranscription:
+        return _transcribe_page_with_retry(self._complete, _normalize_image(png_bytes),
+                                           text_layer, extra_context)
+
     def _call(self, png_bytes: bytes, extra_context: str) -> str:
-        user_text = "Analisis gambar berikut sesuai instruksi sistem."
-        if extra_context:
-            user_text += f"\n\nKonteks tambahan: {extra_context}"
+        return self._complete(png_bytes, DESCRIBE_SYSTEM, _describe_user_text(extra_context),
+                              2048)[0]
+
+    def _complete(self, png_bytes: bytes, system: str, user_text: str,
+                  max_tokens: int) -> tuple[str, int, int]:
+        options = {"temperature": 0.2, "num_predict": max_tokens}
+        if max_tokens > 2048:
+            # Page transcription: image + text layer + long answer overflow
+            # Ollama's small default context window.
+            options["num_ctx"] = 16384
         try:
             resp = self.client.chat(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": DESCRIBE_SYSTEM},
+                    {"role": "system", "content": system},
                     {"role": "user", "content": user_text, "images": [png_bytes]},
                 ],
-                options={"temperature": 0.2, "num_predict": 2048},
+                options=options,
             )
         except self._ollama.ResponseError as e:
             if "not found" in str(e).lower():
@@ -174,7 +296,8 @@ class OllamaClient:
                     f"Jalankan: ollama pull {self.model}"
                 ) from e
             raise
-        return resp["message"]["content"] if isinstance(resp, dict) else resp.message.content
+        text = resp["message"]["content"] if isinstance(resp, dict) else resp.message.content
+        return text or "", 0, 0
 
 
 # ---------- OpenAI (ChatGPT) ----------
@@ -186,6 +309,7 @@ class OpenAIClient:
     _model_attr = "openai_model"
     _base_url_attr = "openai_base_url"
     _label = "OpenAI"
+    is_local = False
 
     def __init__(self, config: Config):
         try:
@@ -206,17 +330,24 @@ class OpenAIClient:
         png_bytes = _normalize_image(image_bytes)
         return _analyze_with_retry(self._call, png_bytes, extra_context)
 
+    def transcribe_page(self, png_bytes: bytes, text_layer: str,
+                        extra_context: str = "") -> PageTranscription:
+        return _transcribe_page_with_retry(self._complete, _normalize_image(png_bytes),
+                                           text_layer, extra_context)
+
     def _call(self, png_bytes: bytes, extra_context: str) -> str:
+        return self._complete(png_bytes, DESCRIBE_SYSTEM, _describe_user_text(extra_context),
+                              2048)[0]
+
+    def _complete(self, png_bytes: bytes, system: str, user_text: str,
+                  max_tokens: int) -> tuple[str, int, int]:
         b64 = base64.standard_b64encode(png_bytes).decode("ascii")
-        user_text = "Analisis gambar berikut sesuai instruksi sistem."
-        if extra_context:
-            user_text += f"\n\nKonteks tambahan: {extra_context}"
         resp = self.client.chat.completions.create(
             model=self.model,
-            max_tokens=2048,
+            max_tokens=max_tokens,
             temperature=0.2,
             messages=[
-                {"role": "system", "content": DESCRIBE_SYSTEM},
+                {"role": "system", "content": system},
                 {
                     "role": "user",
                     "content": [
@@ -231,7 +362,11 @@ class OpenAIClient:
                 },
             ],
         )
-        return (resp.choices[0].message.content or "") if resp.choices else ""
+        text = (resp.choices[0].message.content or "") if resp.choices else ""
+        usage = getattr(resp, "usage", None)
+        return (text,
+                int(getattr(usage, "prompt_tokens", 0) or 0),
+                int(getattr(usage, "completion_tokens", 0) or 0))
 
 
 # ---------- Moonshot (Kimi) — OpenAI-compatible ----------
@@ -247,6 +382,8 @@ class MoonshotClient(OpenAIClient):
 # ---------- Google Gemini ----------
 
 class GeminiClient:
+    is_local = False
+
     def __init__(self, config: Config):
         try:
             from google import genai  # deferred (google-genai package)
@@ -268,14 +405,21 @@ class GeminiClient:
         png_bytes = _normalize_image(image_bytes)
         return _analyze_with_retry(self._call, png_bytes, extra_context)
 
+    def transcribe_page(self, png_bytes: bytes, text_layer: str,
+                        extra_context: str = "") -> PageTranscription:
+        return _transcribe_page_with_retry(self._complete, _normalize_image(png_bytes),
+                                           text_layer, extra_context)
+
     def _call(self, png_bytes: bytes, extra_context: str) -> str:
-        user_text = "Analisis gambar berikut sesuai instruksi sistem."
-        if extra_context:
-            user_text += f"\n\nKonteks tambahan: {extra_context}"
+        return self._complete(png_bytes, DESCRIBE_SYSTEM, _describe_user_text(extra_context),
+                              2048)[0]
+
+    def _complete(self, png_bytes: bytes, system: str, user_text: str,
+                  max_tokens: int) -> tuple[str, int, int]:
         cfg = self._types.GenerateContentConfig(
-            system_instruction=DESCRIBE_SYSTEM,
+            system_instruction=system,
             temperature=0.2,
-            max_output_tokens=2048,
+            max_output_tokens=max_tokens,
         )
         resp = self.client.models.generate_content(
             model=self.model,
@@ -295,7 +439,10 @@ class GeminiClient:
             ],
             config=cfg,
         )
-        return getattr(resp, "text", "") or ""
+        usage = getattr(resp, "usage_metadata", None)
+        return (getattr(resp, "text", "") or "",
+                int(getattr(usage, "prompt_token_count", 0) or 0),
+                int(getattr(usage, "candidates_token_count", 0) or 0))
 
 
 # ---------- Optimization wrapper ----------
@@ -316,6 +463,15 @@ class OptimizedAIClient:
         self.options = options
         self._cache: dict[str, ImageAnalysis] = {}
 
+    @property
+    def is_local(self) -> bool:
+        return getattr(self.inner, "is_local", True)
+
+    def transcribe_page(self, png_bytes: bytes, text_layer: str,
+                        extra_context: str = "") -> PageTranscription:
+        # Page renders are never filtered: the caller decided the page needs it.
+        return self.inner.transcribe_page(png_bytes, text_layer, extra_context)
+
     def analyze_image(self, image_bytes: bytes, media_type: str = "image/png",
                       extra_context: str = "") -> ImageAnalysis:
         opts = self.options
@@ -330,7 +486,7 @@ class OptimizedAIClient:
         if opts.image_min_bytes > 0 and len(image_bytes) < opts.image_min_bytes:
             stats["skipped_tiny"] += 1
             return ImageAnalysis.skipped_result(
-                f"{len(image_bytes)} B < {opts.image_min_bytes} B min"
+                f"{len(image_bytes)} B < {opts.image_min_bytes} B min", silent=True
             )
 
         # 3. Min dim (needs decoding — do it lazily)
@@ -342,7 +498,7 @@ class OptimizedAIClient:
                 if max(img.size) < opts.image_min_dim:
                     stats["skipped_tiny"] += 1
                     return ImageAnalysis.skipped_result(
-                        f"{img.size[0]}x{img.size[1]}, < {opts.image_min_dim}px min"
+                        f"{img.size[0]}x{img.size[1]}, < {opts.image_min_dim}px min", silent=True
                     )
             except Exception:
                 pass  # if PIL can't open, let AI try
@@ -353,7 +509,8 @@ class OptimizedAIClient:
             from .image_heuristics import is_decorative
             if is_decorative(image_bytes):
                 stats["skipped_decorative"] = stats.get("skipped_decorative", 0) + 1
-                return ImageAnalysis.skipped_result("gambar dekoratif (blob/lingkaran solid)")
+                return ImageAnalysis.skipped_result("gambar dekoratif (blob/lingkaran solid)",
+                                                    silent=True)
 
         # 4b. Diagram-only prefilter
         if opts.image_mode == "diagrams_only":
@@ -370,13 +527,15 @@ class OptimizedAIClient:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 stats["skipped_duplicate"] += 1
-                # Return a shallow copy noting dedup (same content, different placeholder)
+                # Already described at its first occurrence — repeating the same
+                # paragraph (a logo on every page) is pure noise.
                 return ImageAnalysis(
                     kind=cached.kind,
                     description=cached.description,
                     mermaid=cached.mermaid,
                     skipped=False,
                     skip_reason="",
+                    silent=True,
                 )
 
         # 6. Actually call the real client
@@ -415,6 +574,34 @@ class HybridAIClient:
         # deciding whether the system prompt has been "cached" yet (Anthropic).
         self._calls_by_provider: dict[str, int] = {}
         self._estimated_cost_usd = 0.0
+        # Page vision runs pages concurrently; guard the counters.
+        import threading
+        self._lock = threading.Lock()
+
+    @property
+    def is_local(self) -> bool:
+        # Slide pages are diagram-heavy, so they follow the diagram route.
+        return self.config.provider_for_kind("diagram") == "ollama"
+
+    def transcribe_page(self, png_bytes: bytes, text_layer: str,
+                        extra_context: str = "") -> PageTranscription:
+        provider = self._pick_provider("diagram", factor=PAGE_COST_FACTOR)
+        if provider == "capped":
+            raise RuntimeError(f"budget cap ${self.config.cost_cap_usd:.2f} tercapai")
+        try:
+            result = self._get_client(provider).transcribe_page(png_bytes, text_layer, extra_context)
+            self._account(provider, factor=PAGE_COST_FACTOR)
+            return result
+        except Exception as primary_err:
+            for alt in self._fallback_order(provider):
+                try:
+                    result = self._get_client(alt).transcribe_page(png_bytes, text_layer,
+                                                                   extra_context)
+                    self._account(alt, factor=PAGE_COST_FACTOR)
+                    return result
+                except Exception:
+                    continue
+            raise primary_err
 
     def _get_client(self, provider: str) -> "AIClient":
         if provider not in self._clients:
@@ -430,13 +617,14 @@ class HybridAIClient:
             self._clients[provider] = factory(self.config)
         return self._clients[provider]
 
-    def _pick_provider(self, kind: str) -> str:
+    def _pick_provider(self, kind: str, factor: float = 1.0) -> str:
         chosen = self.config.provider_for_kind(kind)
         # Budget cap: if this call would push us over cap AND the provider
         # actually costs money, try to downgrade to Ollama.
         if self.config.cost_cap_usd > 0:
             n = self._calls_by_provider.get(chosen, 0)
-            projected = self._estimated_cost_usd + cost_per_call(chosen, is_first=(n == 0))
+            projected = (self._estimated_cost_usd
+                         + cost_per_call(chosen, is_first=(n == 0)) * factor)
             if projected > self.config.cost_cap_usd:
                 if "ollama" in self.config.all_providers_in_use() or self.config.ollama_host:
                     return "ollama"
@@ -455,7 +643,7 @@ class HybridAIClient:
         # Decorative images: never worth an AI call, regardless of provider.
         # (This runs even when OptimizedAIClient isn't wrapping us.)
         if kind == "decorative":
-            return ImageAnalysis.skipped_result("dekoratif (klasifikasi lokal)")
+            return ImageAnalysis.skipped_result("dekoratif (klasifikasi lokal)", silent=True)
 
         provider = self._pick_provider(kind)
         if provider == "capped":
@@ -498,10 +686,11 @@ class HybridAIClient:
                 seen.add(p)
         return order
 
-    def _account(self, provider: str) -> None:
-        n = self._calls_by_provider.get(provider, 0)
-        self._calls_by_provider[provider] = n + 1
-        self._estimated_cost_usd += cost_per_call(provider, is_first=(n == 0))
+    def _account(self, provider: str, factor: float = 1.0) -> None:
+        with self._lock:
+            n = self._calls_by_provider.get(provider, 0)
+            self._calls_by_provider[provider] = n + 1
+            self._estimated_cost_usd += cost_per_call(provider, is_first=(n == 0)) * factor
 
     @property
     def estimated_cost_usd(self) -> float:
@@ -576,6 +765,189 @@ def _analyze_with_retry(call_fn, png_bytes: bytes, extra_context: str) -> ImageA
             kind = kind2
 
     return ImageAnalysis(kind=kind, description=desc, mermaid=mermaid)
+
+
+def _describe_user_text(extra_context: str) -> str:
+    user_text = "Analisis gambar berikut sesuai instruksi sistem."
+    if extra_context:
+        user_text += f"\n\nKonteks tambahan: {extra_context}"
+    return user_text
+
+
+# ---------- Page vision ----------
+
+PAGE_MAX_TOKENS = 8192
+# Below this share of text-layer words found in the answer, retry once.
+PAGE_MIN_COVERAGE = 0.92
+
+_TEXT_LAYER_POS_RE = re.compile(r"^\s*\[x=[\d.]+ y=[\d.]+\] ?")
+_TEXT_LAYER_TAG_RE = re.compile(r"\s*\{(?:box S\d+|legend: [^{}]*)\}\s*$")
+_MERMAID_BLOCK_RE = re.compile(r"```mermaid[ \t]*\n(.*?)```", re.DOTALL)
+_WORD_RE = re.compile(r"\w+")
+
+
+def format_text_layer_entry(x: float, y: float, text: str) -> str:
+    """One text-layer entry: position prefix, continuation lines indented."""
+    prefix = f"[x={x:.2f} y={y:.2f}] "
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return prefix + ("\n" + " " * len(prefix)).join(lines)
+
+
+def _text_layer_entries(text_layer: str) -> list[str]:
+    """Split a formatted text layer back into plain-text entries (without
+    style tags). Stops at the first section after the entries (box styles,
+    connectors)."""
+    entries: list[str] = []
+    for line in text_layer.splitlines():
+        if _TEXT_LAYER_POS_RE.match(line):
+            entries.append(_TEXT_LAYER_TAG_RE.sub("", _TEXT_LAYER_POS_RE.sub("", line)))
+        elif line[:1].isspace() and line.strip() and entries:
+            entries[-1] += " " + _TEXT_LAYER_TAG_RE.sub("", line.strip())
+        elif line.strip():
+            break
+    return entries
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in _WORD_RE.findall(text.lower()) if len(w) > 1 or w.isdigit()}
+
+
+def page_coverage(text_layer: str, markdown: str) -> tuple[float, list[str]]:
+    """Share of distinct text-layer words present in `markdown`, plus the
+    entries that are mostly missing (used to steer a retry)."""
+    out_words = _words(markdown)
+    entries = _text_layer_entries(text_layer)
+    layer_words: set[str] = set()
+    missing: list[str] = []
+    for entry in entries:
+        ws = _words(entry)
+        layer_words |= ws
+        if ws and len(ws & out_words) / len(ws) < 0.6:
+            missing.append(entry)
+    if not layer_words:
+        return 1.0, []
+    return len(layer_words & out_words) / len(layer_words), missing
+
+
+_LETTER_WORD_RE = re.compile(r"[^\W\d_]{3,}")
+# Words the page-vision rules themselves ask for.
+_PAGE_SCAFFOLD_WORDS = {"legend", "figure", "recommended", "label"}
+# Retry when the answer brings in more distinct new words than this.
+PAGE_MAX_ADDED_WORDS = 2
+
+
+def added_words(text_layer: str, markdown: str) -> list[str]:
+    """Words in `markdown` that are nowhere on the page — invented legends,
+    explanations, colour names. Figure lines and Mermaid syntax (node ids,
+    keywords) are skipped; inside Mermaid only quoted labels count."""
+    page = "".join(_text_layer_entries(text_layer)).lower()
+    page = re.sub(r"\W", "", page)
+    scanned: list[str] = []
+    in_code = False
+    for line in markdown.splitlines():
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            scanned.extend(re.findall(r'"([^"]*)"', line))
+        elif not line.lstrip().startswith("> **Figure:**"):
+            scanned.append(line)
+    out: list[str] = []
+    for word in _LETTER_WORD_RE.findall(" ".join(scanned).replace("<br/>", " ")):
+        w = word.lower()
+        if w not in page and w not in _PAGE_SCAFFOLD_WORDS and w not in out:
+            out.append(w)
+    return out
+
+
+def _clean_page_markdown(text: str) -> str:
+    text = text.strip()
+    # Whole answer wrapped in a ```markdown fence despite instructions.
+    m = re.match(r"^```(?:markdown|md)?[ \t]*\n(.*)\n```$", text, re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+    # `#` is reserved for the document title; demote page-level H1s.
+    out: list[str] = []
+    in_code = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+        if not in_code and line.startswith("# "):
+            line = "#" + line
+        out.append(line)
+    return "\n".join(out)
+
+
+def _check_page_mermaid(markdown: str) -> tuple[str, list[str]]:
+    """Autofix Mermaid blocks in place; return (markdown, problems left)."""
+    problems: list[str] = []
+
+    def _fix(m: re.Match[str]) -> str:
+        src = m.group(1)
+        ok, reasons = _validate_mermaid(src)
+        if ok:
+            return m.group(0)
+        fixed = _autofix_mermaid(src)
+        ok2, reasons2 = _validate_mermaid(fixed)
+        if ok2:
+            return "```mermaid\n" + fixed.strip() + "\n```"
+        first = src.strip().splitlines()[0] if src.strip() else ""
+        problems.append(f"Mermaid block starting `{first}` is invalid: {'; '.join(reasons2)}")
+        return m.group(0)
+
+    return _MERMAID_BLOCK_RE.sub(_fix, markdown), problems
+
+
+def _demote_invalid_mermaid(markdown: str) -> tuple[str, int]:
+    count = 0
+
+    def _demote(m: re.Match[str]) -> str:
+        nonlocal count
+        if _validate_mermaid(m.group(1))[0]:
+            return m.group(0)
+        count += 1
+        return ("*(Diagram Mermaid tidak valid — ditampilkan sebagai teks)*\n\n```\n"
+                + m.group(1).strip() + "\n```")
+
+    return _MERMAID_BLOCK_RE.sub(_demote, markdown), count
+
+
+def _transcribe_page_with_retry(complete_fn, png_bytes: bytes, text_layer: str,
+                                extra_context: str) -> PageTranscription:
+    """One page → Markdown. Retries once if words from the text layer went
+    missing or a Mermaid block is invalid; keeps the better attempt."""
+    base_user = (extra_context.strip() + "\n\n" if extra_context.strip() else "") \
+        + "TEXT LAYER:\n" + (text_layer.strip() or "(no text on this page)")
+
+    def _attempt(user_text: str):
+        raw, tin, tout = complete_fn(png_bytes, PAGE_SYSTEM, user_text, PAGE_MAX_TOKENS)
+        md, problems = _check_page_mermaid(_clean_page_markdown(raw))
+        cov, missing = page_coverage(text_layer, md)
+        extra = added_words(text_layer, md) if text_layer.strip() else []
+        if len(extra) > PAGE_MAX_ADDED_WORDS:
+            problems.append("You added words that are not on the page ("
+                            + ", ".join(extra[:20]) + "). Remove every invented legend, "
+                            "explanation or colour name; keep only the page's own text.")
+        return md, problems, cov, missing, tin, tout
+
+    md, problems, cov, missing, tin, tout = _attempt(base_user)
+    retried = False
+    if problems or cov < PAGE_MIN_COVERAGE:
+        issues = list(problems)
+        if missing:
+            listed = "\n".join(f"  - {e}" for e in missing[:40])
+            issues.append("These text-layer entries are missing from your answer:\n" + listed)
+        hint = PAGE_RETRY_TEMPLATE.format(problems="\n".join(f"- {p}" for p in issues))
+        md2, problems2, cov2, _missing2, tin2, tout2 = _attempt(base_user + "\n\n" + hint)
+        retried = True
+        tin += tin2
+        tout += tout2
+        if (len(problems2), -cov2) < (len(problems), -cov):
+            md, cov = md2, cov2
+
+    md, invalid = _demote_invalid_mermaid(md)
+    return PageTranscription(markdown=md, coverage=cov, retried=retried,
+                             invalid_mermaid=invalid, input_tokens=tin, output_tokens=tout)
 
 
 # ---------- Shared helpers ----------
@@ -657,6 +1029,9 @@ _MERMAID_BAD_PATTERNS: list[tuple[re.Pattern[str], str]] = [
      "`?` in a bare node identifier (put it inside `{...}` label)"),
     (re.compile(r"(?:-->|---)\s*[A-Za-z_]\w*\s+\["),
      "space between arrow-target id and its `[label]`"),
+    # `A[Foo (bar)]` is a parse error; `A[(db)]` (cylinder) is fine.
+    (re.compile(r"\w\[(?!\()[^\]\"\n]*[()][^\]\"\n]*\]"),
+     "parentheses inside an unquoted `[label]` (quote the label)"),
 ]
 _MERMAID_TYPES = (
     "flowchart", "graph", "sequenceDiagram", "classDiagram", "stateDiagram",
@@ -672,10 +1047,28 @@ def _validate_mermaid(src: str) -> tuple[bool, list[str]]:
     first_line = stripped.splitlines()[0].strip()
     if not first_line.startswith(_MERMAID_TYPES):
         return False, [f"first line `{first_line}` isn't a known Mermaid diagram type"]
+    # Quoted labels may legally contain `?`, brackets and spaces — blank them
+    # out so the pattern checks only see the diagram's syntax.
+    scan = re.sub(r'"[^"\n]*"', '""', stripped)
+    scan = re.sub(r"^\s*%%.*$", "", scan, flags=re.MULTILINE)
     reasons: list[str] = []
     for pat, why in _MERMAID_BAD_PATTERNS:
-        if pat.search(stripped):
+        if pat.search(scan):
             reasons.append(why)
+    if '"' in re.sub(r'"[^"\n]*"', "", stripped):
+        reasons.append("a quoted label spans several lines (use <br/>) or quotes are unbalanced")
+    if first_line.startswith(("flowchart", "graph")):
+        # Flowchart node shapes must close; `id>label]` (asymmetric) is the
+        # one shape with a lone bracket.
+        shapes = re.sub(r"(\w)>[^\]\n]*\]", r"\1", scan)
+        for open_ch, close_ch in (("[", "]"), ("{", "}"), ("(", ")")):
+            if shapes.count(open_ch) != shapes.count(close_ch):
+                reasons.append(f"unbalanced `{open_ch}{close_ch}`")
+        lines = [ln.strip() for ln in scan.splitlines()]
+        opened = sum(1 for ln in lines if ln.startswith("subgraph"))
+        closed = sum(1 for ln in lines if ln == "end")
+        if opened != closed:
+            reasons.append(f"{opened} `subgraph` vs {closed} `end`")
     return (not reasons), reasons
 
 
@@ -683,6 +1076,16 @@ def _autofix_mermaid(src: str) -> str:
     """Best-effort repair for common VLM mistakes. Runs rules to a fixed point."""
     prev = None
     fixed = src
+    # A quoted label broken over several lines → one line with <br/>.
+    # Quotes pair up in order, so every odd-numbered segment is a label.
+    parts = fixed.split('"')
+    if len(parts) % 2 == 1:
+        for i in range(1, len(parts), 2):
+            if "\n" in parts[i]:
+                parts[i] = re.sub(r"\s*\n\s*", "<br/>", parts[i].strip())
+        fixed = '"'.join(parts)
+    # `A[Foo (bar)]` → `A["Foo (bar)"]`
+    fixed = re.sub(r"(\w)\[(?!\()([^\]\"\n]*[()][^\]\"\n]*)\]", r'\1["\2"]', fixed)
     for _ in range(5):
         if fixed == prev:
             break

@@ -12,6 +12,7 @@ from typing import Literal
 ImageMode = Literal["all", "diagrams_only", "none"]
 OCRMode = Literal["auto", "always", "never"]
 OCREngine = Literal["tesseract", "paddleocr", "ai", "hybrid"]
+PageVisionMode = Literal["auto", "always", "never"]
 
 
 @dataclass
@@ -49,6 +50,15 @@ class ConvertOptions:
     ocr_engine: OCREngine = "tesseract"
     ocr_lang: str = "ind+eng"
 
+    # PDF page vision: render each page and let a vision model write its
+    # Markdown, anchored on the page's text layer. Recovers what per-element
+    # extraction loses on slide decks: vector diagrams, borderless tables,
+    # multi-column reading order.
+    #   "auto"   = slide-deck PDFs only, and only with a cloud provider
+    #   "always" = every page with content, any provider (Ollama included)
+    #   "never"  = classic text + table + image extraction
+    pdf_page_vision: PageVisionMode = "auto"
+
     # Runtime counters (mutable) — the wrapper updates these so the GUI can
     # show "hemat N calls". Values are numeric (int for counts, float for cost).
     _stats: dict[str, float] = field(default_factory=lambda: {
@@ -58,7 +68,14 @@ class ConvertOptions:
         "skipped_not_diagram": 0,
         "skipped_mode_none": 0,
         "skipped_decorative": 0,
+        "skipped_template": 0,
         "ocr_pages": 0,
+        "page_vision_pages": 0,
+        "page_vision_retries": 0,
+        "page_vision_fallbacks": 0,
+        "page_vision_min_coverage": 1.0,
+        "page_vision_tokens_in": 0,
+        "page_vision_tokens_out": 0,
         "anthropic_calls": 0,
         "est_cost_usd": 0.0,
     })
@@ -79,9 +96,20 @@ class ConvertOptions:
         s = self._stats
         skipped = (s["skipped_tiny"] + s["skipped_duplicate"]
                    + s["skipped_not_diagram"] + s["skipped_mode_none"]
-                   + s.get("skipped_decorative", 0))
+                   + s.get("skipped_decorative", 0) + s.get("skipped_template", 0))
         total = s["sent"] + skipped
         parts: list[str] = []
+        if s.get("page_vision_pages"):
+            pv = (f"{int(s['page_vision_pages'])} halaman via AI per halaman "
+                  f"(cakupan teks min {s['page_vision_min_coverage']:.0%}")
+            if s.get("page_vision_retries"):
+                pv += f", {int(s['page_vision_retries'])} diulang"
+            if s.get("page_vision_tokens_in"):
+                pv += (f", token {int(s['page_vision_tokens_in'])} in"
+                       f" / {int(s['page_vision_tokens_out'])} out")
+            parts.append(pv + ")")
+        if s.get("page_vision_fallbacks"):
+            parts.append(f"{int(s['page_vision_fallbacks'])} halaman gagal AI → ekstraksi teks")
         if total > 0:
             parts.append(f"{s['sent']}/{total} gambar dikirim ke AI")
             if s["skipped_duplicate"]:
@@ -90,6 +118,8 @@ class ConvertOptions:
                 parts.append(f"{s['skipped_tiny']} terlalu kecil")
             if s.get("skipped_decorative", 0):
                 parts.append(f"{s['skipped_decorative']} hiasan")
+            if s.get("skipped_template", 0):
+                parts.append(f"{s['skipped_template']} template berulang")
             if s["skipped_not_diagram"]:
                 parts.append(f"{s['skipped_not_diagram']} bukan diagram")
             if s["skipped_mode_none"]:
@@ -130,6 +160,9 @@ class ConvertOptions:
         if ocr_engine not in {"tesseract", "paddleocr", "ai", "hybrid"}:
             ocr_engine = "tesseract"
         ocr_lang = os.getenv("ANYTOMD_OCR_LANG", "ind+eng").strip() or "ind+eng"
+        page_vision = os.getenv("ANYTOMD_PDF_PAGE_VISION", "auto").strip().lower()
+        if page_vision not in {"auto", "always", "never"}:
+            page_vision = "auto"
 
         return cls(
             image_dedup=_flag("ANYTOMD_IMAGE_DEDUP", False),
@@ -140,4 +173,5 @@ class ConvertOptions:
             ocr_mode=ocr_mode,  # type: ignore[arg-type]
             ocr_engine=ocr_engine,  # type: ignore[arg-type]
             ocr_lang=ocr_lang,
+            pdf_page_vision=page_vision,  # type: ignore[arg-type]
         )

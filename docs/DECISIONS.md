@@ -366,3 +366,34 @@ All rarely-changed config (API keys, hybrid routing, model IDs, base URLs, cost 
 - Provider switching between conversions stays in the toolbar (frequent action). Hybrid routing tucked into Settings (set once, rarely touched).
 - QSS is minimal — heavy styling breaks on macOS/Linux. Current palette works with native controls beneath.
 - `ProviderPanel` widget kept in code (embeddable) but unused in current MainWindow — could be re-added if we ever want a "quick advanced settings" sidebar.
+
+---
+
+## 2026-09-27 — PDF slide decks: page vision anchored on the text layer and the vector drawing
+
+**Context**: Two real slide decks exported from LibreOffice Impress (4 and 14 pages, client material) came out of the PDF converter badly, with Ollama and with Anthropic alike: vector architecture diagrams became scattered words, tables without rulings were missed or mangled, two-column layouts interleaved, step labels (`1  CUSTOMER`) became `##` headings, and 742 "images" produced ~740 placeholder lines. A plain Claude read of the same PDFs was far better. The problems sit *before* the AI call, so a better model alone changed nothing.
+
+**Options**:
+- (A) Keep per-element extraction and add heuristics: borderless-table detection, reading-order clustering, vector-graph reconstruction into Mermaid. Deterministic, but every slide layout is a new special case.
+- (B) Send each rendered page to a vision model and let it write the Markdown ("Claude-direct" inside the app).
+- (C) (B), with the page's text layer attached so wording is copied rather than read off pixels, plus exact facts from the PDF drawing (legend colour per box, connectors with direction and labels), and machine checks on the answer.
+
+**Decision**: (C), for slide decks only by default (`pdf_page_vision="auto"`: deck detected by app name or screen ratio, cloud model only).
+- First runs of (B)+text layer showed the model's weak spots were exactly the fine visual facts: dashed vs solid purple borders (Phase 2 vs 3 put in the wrong column), arrowhead direction (I1–I6 reversed), and badge labels on arrows. All three are exact in the PDF, so `converters/pdf_vector.py` reads them and tags the text layer (`{legend: Phase 2}`, `CONNECTORS: "Source system" → "Platform…" (label "I1")`). Matching boxes to legend entries in code, not in the prompt, took the architecture slide from wrong to 71/71 fragments in the right phase column.
+- The model then added a sentence of its own (a colour-coded explanation of the arrow badges) and a legend that isn't on the slide. The answer is now checked: coverage (text-layer words present, retry below 92%), invented words (retry above 2), Mermaid validity (autofix, then retry, then demote). One retry, better attempt kept.
+
+**Consequences**:
+- The two decks: 0.0–0.1% of words lost, no invented text, every Mermaid block parses in the real Mermaid parser, 18 pages in ~50 s with Anthropic (4 pages in parallel), ~46k input tokens (plus the cached system prompt) / ~7k output tokens.
+- Offline (Ollama) is not covered by `auto`: a 7B VLM misreads dense slides. `always` exists for those who want to try; the text path got the cheap fixes instead (painted-only images, template images, silent placeholders, heading rule, whole-word table cells).
+- Vector hints only exist for vector drawings. A slide pasted into the PDF as one bitmap gets the image and whatever text layer there is.
+- Side-by-side independent panels are sometimes still rendered as a one-row table; the prompt asks for `###` sections, the model mostly complies.
+
+---
+
+## 2026-09-27 — Placeholders for skipped images are silent
+
+**Context**: A 14-page deck produced ~700 `> *[Gambar dilewati (gambar dekoratif …)]*` lines and the same logo description on every page. Placeholders were meant to be honest about what was skipped; at that volume they bury the content.
+
+**Decision**: `ImageAnalysis.silent` — decorative, too small, template (painted on ≥50% of pages), and repeats of an already-described image produce no Markdown. Placeholders stay where the user made a choice (`mode: none`, `diagrams_only`) or a limit hit (budget cap). Counts remain in the stats line.
+
+**Consequences**: Output of the dedup fixture shrinks to text + one diagram. Anyone who wants to see every skip can still read the stats; a verbose mode can come back if asked.

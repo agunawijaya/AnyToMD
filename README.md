@@ -19,7 +19,22 @@ AnyToMD's design principle: **text is truth for text; AI is only for what text c
 | Handles scanned PDF | ✅ (4 OCR engines) | ❌ | ✅ |
 | Cost | 0 (Ollama) or ~$0.20 (Anthropic hybrid) | 0 | $$$ (page-vision every page) |
 
-For a 6-page report with a header logo on every page + 1 real diagram, this drops the AI bill from **7 image calls to 1** with two toggles enabled.
+*Correction (2026-09-27): part of those 114 table rows had words cut off at the table edge — 1.3% of the document's words were silently lost. Fixed; a no-AI run now captures 122 table rows with 0.0% word loss.*
+
+For a 6-page report with a header logo on every page + 1 real diagram, this drops the AI bill from **7 image calls to 1** — the logo is recognised as page template and never sent.
+
+### Slide decks exported to PDF (2026-09-27)
+
+Slides exported to PDF (PowerPoint, Impress, Keynote, Google Slides) defeat per-element extraction: architecture diagrams are vector shapes, tables have no rulings, panels sit side by side. With a cloud provider, AnyToMD now reads such PDFs **page by page with the vision model**, anchored on the page's own text layer and on facts read exactly from the PDF drawing (which legend colour each box has, which way each arrow points, the badge on an arrow). On two real decks (18 slides) against a direct Claude read of the same PDFs:
+
+| Metric | AnyToMD before | AnyToMD now | Claude direct |
+|---|---|---|---|
+| Tables | 1 | 9 | 7 |
+| Mermaid diagrams (all parse) | 0 | 6 | 7 |
+| Words of the PDF missing | 0.0–0.1% | 0.0–0.1% | 0.0–0.3% |
+| Image placeholder lines | 944 | 0 | 0 |
+| Phase/colour of each box on a layered architecture slide | lost | 71/71 correct | correct |
+| Time / tokens | 50 s | ~50 s; ~46k input (plus the cached system prompt) / ~7k output tokens | — |
 
 ---
 
@@ -54,7 +69,7 @@ Drag any PDF/PPTX/DOCX/XLSX/HTML/image into the drop zone, or press Ctrl+O.
 │    ║   PDF · PPTX · DOCX · XLSX · HTML   ║        click to browse)
 │    ╚═════════════════════════════════════╝     
 │                                                 
-│  [ Filter gambar ]        [ OCR untuk PDF scan ]  ← options side-by-side
+│  [ Filter gambar ] [ OCR untuk PDF scan ] [ PDF slide → AI per halaman ]
 │                                                 
 ├──── draggable splitter ────────────────────────
 │  Preview                              [📋 Copy]  ← preview grows to fill
@@ -75,7 +90,7 @@ Keyboard shortcuts: `Ctrl+O` open · `Ctrl+S` save · `Ctrl+,` settings · `Ctrl
 
 Convert **PDF**, **PPTX**, **DOCX**, **XLSX**, **HTML**, and **PNG/JPG** files into clean Markdown.
 
-- **PDF** → strips repeated header/footer/page numbers, keeps body text, **detects tables via pdfplumber** and interleaves them with text by y-position, describes embedded images. **Scanned/image-only PDFs** can be OCR'd (auto-detect or forced) with a choice of engine: Tesseract, PaddleOCR, AI vision, or hybrid.
+- **PDF** → strips repeated header/footer/page numbers, keeps body text, **detects tables via pdfplumber** and interleaves them with text by y-position, describes embedded images where they sit (in the document's language; logos/backgrounds repeated on most pages are skipped). **Scanned/image-only PDFs** can be OCR'd (auto-detect or forced) with a choice of engine: Tesseract, PaddleOCR, AI vision, or hybrid. **Slide decks exported to PDF** are read page by page by the vision model (cloud providers; `ANYTOMD_PDF_PAGE_VISION=auto|always|never`): Mermaid for boxes and arrows, tables for grids, legend colours written next to each item — wording copied from the PDF and checked.
 - **PPTX** → per-slide content + **speaker notes** + layout description + **native charts as markdown tables (zero AI)** + Mermaid diagrams for pictures **and** for native shape diagrams (auto-rasterized). **Author-supplied Alt Text is used verbatim, bypassing the AI.** Slide number & footer placeholders skipped.
 - **DOCX** → headings, paragraphs, lists, tables (as MD tables), inline images described. Word headers/footers/page numbers are outside the document body, so they're naturally skipped.
 - **XLSX** → each sheet becomes its own `## Sheet: <name>` section with a Markdown table. Trailing empty rows/columns trimmed. Large sheets capped (5000 rows × 100 cols).
@@ -180,6 +195,7 @@ Then drag & drop a file into the window, or use **Browse**. The `.md` output is 
 |------------------------|---------------------------------------------------------|
 | PDF text + images      | PyMuPDF (`fitz`)                                        |
 | PDF tables             | pdfplumber (rulings → cells, interleaved with text)     |
+| PDF slide decks        | page render + vision model, anchored on the text layer and on vector hints (legend colour per box, connectors) read from the PDF drawing; coverage / invented-word / Mermaid checks with one retry |
 | Header/footer stripper | position (top/bottom 10%) + repeat-frequency ≥ 35%      |
 | PPTX parsing           | python-pptx (shapes, placeholders, tables, pictures, **charts**, **notes**) |
 | PPTX shape rasterizer  | Pillow — rectangles/rounded/oval/diamond + connectors   |
@@ -222,6 +238,7 @@ Anthropic system prompt di-cache (`cache_control: ephemeral`) — dokumen multi-
 | PDF text-only | **0** |
 | **XLSX apapun** | **0** — selalu |
 | PDF/PPTX/DOCX dengan gambar | 1 per gambar |
+| PDF slide deck, provider cloud (page vision `auto`) | 1 per halaman (+1 kalau hasil gagal cek) |
 | PPTX dengan shape diagram | 1 per slide shape-diagram (rasterized) |
 | Standalone PNG/JPG | 1 |
 
