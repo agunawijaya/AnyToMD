@@ -1,0 +1,8 @@
+# Binary fixtures: never diff or convert line endings (core.autocrlf=true on Windows)
+*.pdf  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.pptx binary
+*.docx binary
+*.xlsx binary
