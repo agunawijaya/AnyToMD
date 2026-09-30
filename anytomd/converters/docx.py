@@ -16,6 +16,7 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 from ..ai_client import AIClient
+from ..lang import detect_language
 
 ProgressFn = Callable[[str], None]
 
@@ -25,6 +26,7 @@ _HEADING_RE = re.compile(r"^heading\s+(\d)$", re.IGNORECASE)
 def convert_docx(path: Path, ai: AIClient, progress: ProgressFn | None = None) -> str:
     doc = Document(str(path))
     out: list[str] = [f"# {path.stem}", ""]
+    language = detect_language(" ".join(p.text for p in doc.paragraphs))
 
     img_counter = 0
     para_counter = 0
@@ -59,14 +61,17 @@ def convert_docx(path: Path, ai: AIClient, progress: ProgressFn | None = None) -
                     analysis = ai.analyze_image(
                         blob,
                         media_type=ctype or "image/png",
-                        extra_context=f"Gambar ini dari sebuah DOCX (inline pada dokumen).",
+                        extra_context=("Gambar ini dari sebuah DOCX (inline pada dokumen). "
+                                       f"Output language: {language}."),
                     )
                 except Exception as e:
                     out.append(f"> *[Gagal analisa gambar {img_counter}: {e}]*")
                     out.append("")
                     continue
-                out.append(analysis.to_markdown_block(alt_hint=f"docx_img{img_counter}"))
-                out.append("")
+                block = analysis.to_markdown_block(alt_hint=f"docx_img{img_counter}")
+                if block:  # silent: logo, icon, repeat
+                    out.append(block)
+                    out.append("")
 
         elif tag == "tbl":
             table_counter += 1

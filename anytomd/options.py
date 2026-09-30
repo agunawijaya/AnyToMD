@@ -59,6 +59,12 @@ class ConvertOptions:
     #   "never"  = classic text + table + image extraction
     pdf_page_vision: PageVisionMode = "auto"
 
+    # PPTX slide vision: render each slide (PowerPoint if installed, else a
+    # PIL approximation) and let a vision model structure it, anchored on the
+    # slide XML's text; tables, pictures and flowcharts are filled in from
+    # the file itself. Same modes as pdf_page_vision ("auto" = cloud only).
+    pptx_slide_vision: PageVisionMode = "auto"
+
     # Runtime counters (mutable) — the wrapper updates these so the GUI can
     # show "hemat N calls". Values are numeric (int for counts, float for cost).
     _stats: dict[str, float] = field(default_factory=lambda: {
@@ -69,6 +75,7 @@ class ConvertOptions:
         "skipped_mode_none": 0,
         "skipped_decorative": 0,
         "skipped_template": 0,
+        "ai_decorative": 0,  # sent, but the model called it a logo/icon → no output
         "ocr_pages": 0,
         "page_vision_pages": 0,
         "page_vision_retries": 0,
@@ -118,6 +125,8 @@ class ConvertOptions:
                 parts.append(f"{s['skipped_tiny']} terlalu kecil")
             if s.get("skipped_decorative", 0):
                 parts.append(f"{s['skipped_decorative']} hiasan")
+            if s.get("ai_decorative", 0):
+                parts.append(f"{s['ai_decorative']} logo/ikon (dinilai AI, tidak ditulis)")
             if s.get("skipped_template", 0):
                 parts.append(f"{s['skipped_template']} template berulang")
             if s["skipped_not_diagram"]:
@@ -163,6 +172,9 @@ class ConvertOptions:
         page_vision = os.getenv("ANYTOMD_PDF_PAGE_VISION", "auto").strip().lower()
         if page_vision not in {"auto", "always", "never"}:
             page_vision = "auto"
+        slide_vision = os.getenv("ANYTOMD_PPTX_SLIDE_VISION", "auto").strip().lower()
+        if slide_vision not in {"auto", "always", "never"}:
+            slide_vision = "auto"
 
         return cls(
             image_dedup=_flag("ANYTOMD_IMAGE_DEDUP", False),
@@ -174,4 +186,5 @@ class ConvertOptions:
             ocr_engine=ocr_engine,  # type: ignore[arg-type]
             ocr_lang=ocr_lang,
             pdf_page_vision=page_vision,  # type: ignore[arg-type]
+            pptx_slide_vision=slide_vision,  # type: ignore[arg-type]
         )

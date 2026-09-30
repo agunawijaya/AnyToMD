@@ -10,9 +10,31 @@ from __future__ import annotations
 import io
 from typing import Literal
 
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 
 ImageClass = Literal["decorative", "photo", "chart", "screenshot", "diagram", "unknown"]
+
+_WHITE = (255, 255, 255)
+_BLACK = (0, 0, 0)
+
+
+def _has_alpha(img: Image.Image) -> bool:
+    return img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info
+
+
+def load_rgb(image_bytes: bytes, background: tuple[int, int, int] = _WHITE) -> Image.Image:
+    """Open an image as RGB with transparency flattened onto `background`.
+
+    A bare `convert("RGB")` turns transparent pixels black: a PNG of black
+    text on a transparent background (common in slide exports) becomes a
+    solid black block.
+    """
+    img = Image.open(io.BytesIO(image_bytes))
+    if not _has_alpha(img):
+        return img.convert("RGB")
+    rgba = img.convert("RGBA")
+    base = Image.new("RGBA", rgba.size, background + (255,))
+    return Image.alpha_composite(base, rgba).convert("RGB")
 
 
 def looks_like_diagram(image_bytes: bytes) -> bool:
@@ -24,7 +46,7 @@ def looks_like_diagram(image_bytes: bytes) -> bool:
       - High proportion of near-white pixels (whiteboard/canvas background).
     """
     try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img = load_rgb(image_bytes)
     except Exception:
         # If PIL can't open it, be safe: treat as diagram-worthy so we don't drop it
         return True
@@ -69,12 +91,19 @@ def is_decorative(image_bytes: bytes) -> bool:
       - Dominant color covers ≥60% of pixels
       - Low edge density (<2%) — no text, no line art, no logo strokes
       - No high-frequency detail (few sharp gradients)
+
+    A transparent image must look decorative on white AND on black: dark text
+    vanishes on black, white text vanishes on white.
     """
     try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img = Image.open(io.BytesIO(image_bytes))
+        backgrounds = (_WHITE, _BLACK) if _has_alpha(img) else (_WHITE,)
+        return all(_is_decorative_rgb(load_rgb(image_bytes, bg)) for bg in backgrounds)
     except Exception:
         return False
 
+
+def _is_decorative_rgb(img: Image.Image) -> bool:
     img.thumbnail((160, 160), Image.LANCZOS)
     total_px = max(1, img.size[0] * img.size[1])
 
@@ -88,12 +117,62 @@ def is_decorative(image_bytes: bytes) -> bool:
     dominant_share = max(color_counts.values()) / total_px
     distinct = len(color_counts)
 
-    # Edge density
+    # Edge density. FIND_EDGES leaves the 1px frame unfiltered (raw brightness),
+    # which would count the frame of any light image as edges — drop it.
     edges = img.convert("L").filter(ImageFilter.FIND_EDGES)
+    w, h = edges.size
+    if w > 2 and h > 2:
+        edges = edges.crop((1, 1, w - 1, h - 1))
     edge_px = sum(1 for p in edges.getdata() if p > 60)
-    edge_ratio = edge_px / total_px
+    edge_ratio = edge_px / max(1, edges.size[0] * edges.size[1])
 
     return distinct <= 4 and dominant_share >= 0.60 and edge_ratio < 0.02
+
+
+ICON_MAX_SIDE = 128  # px; icons and bullets, too small to carry readable content
+
+
+def is_icon_sized(image_bytes: bytes) -> bool:
+    """True for pictures no larger than an icon (longest side ≤ 128 px).
+    Small vision models turn these into invented diagrams or text."""
+    try:
+        return max(Image.open(io.BytesIO(image_bytes)).size) <= ICON_MAX_SIDE
+    except Exception:
+        return False
+
+
+def perceptual_hash(image_bytes: bytes) -> tuple[int, float] | None:
+    """256-bit difference hash of the image's content box, plus its aspect ratio.
+
+    The plain border is trimmed first, so the same logo exported with a
+    different crop, padding or resolution hashes alike. None if unreadable.
+    """
+    try:
+        gray = load_rgb(image_bytes).convert("L")
+    except Exception:
+        return None
+    box = ImageOps.invert(gray).point(lambda v: 255 if v > 24 else 0).getbbox()
+    if box:
+        gray = gray.crop(box)
+    w, h = gray.size
+    if w < 2 or h < 2:
+        return None
+    px = list(gray.resize((17, 16), Image.LANCZOS).getdata())
+    bits = 0
+    for y in range(16):
+        for x in range(16):
+            bits = (bits << 1) | (px[y * 17 + x] > px[y * 17 + x + 1])
+    return bits, w / h
+
+
+def same_picture(a: tuple[int, float], b: tuple[int, float]) -> bool:
+    """True if two `perceptual_hash` results show the same picture.
+
+    Measured on a real deck: the same logo in two crops differs by ≤11 of 256
+    bits, different pictures by ≥100.
+    """
+    (ha, ra), (hb, rb) = a, b
+    return bin(ha ^ hb).count("1") <= 24 and abs(ra - rb) <= 0.15 * max(ra, rb)
 
 
 def classify_image(image_bytes: bytes) -> ImageClass:
@@ -107,7 +186,7 @@ def classify_image(image_bytes: bytes) -> ImageClass:
     if is_decorative(image_bytes):
         return "decorative"
     try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img = load_rgb(image_bytes)
     except Exception:
         return "unknown"
     img.thumbnail((256, 256), Image.LANCZOS)

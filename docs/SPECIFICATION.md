@@ -7,7 +7,7 @@ Behavior contract per format. Anything the code does that isn't documented here 
 - Output is a single UTF-8 `.md` file, same stem as input, saved next to source by default. GUI's *Simpan .md…* lets user choose another destination.
 - File starts with `# <stem>` as level-1 heading. All subsequent structure is level ≥ 2 to avoid competing with the title.
 - No BOM. LF line endings (Python default).
-- Placeholder pattern for images: block-quote header `> **[Gambar dalam dokumen asli — <kind>]**`, then a paragraph of description, optional fenced Mermaid, then italic `*(Placeholder: <hint>)*`. This is machine-parseable via the leading `> **[Gambar dalam dokumen asli — ` marker if the user wants to post-process.
+- Images (2026-09-30): a picture that *is* content — a table, a paragraph pasted as a picture — comes out as that content (Markdown table / text) with no wrapper. Any other picture is one line `> **Gambar (<kind>):** <description>`, plus a fenced Mermaid block for a diagram. Logos, icons and repeats produce nothing. The `> **Gambar (` prefix is the marker for post-processing. (Before 2026-09-30: a `> **[Gambar dalam dokumen asli — <kind>]**` header, the description, and an `*(Placeholder: <hint>)*` line.)
 
 ## 2. Providers
 
@@ -50,11 +50,15 @@ All optimization keys are also editable **live in the GUI** via the "Optimasi to
 
 Both providers implement `AIClient.analyze_image(image_bytes, media_type, extra_context) -> ImageAnalysis`. See [ARCHITECTURE.md § Vision pipeline](ARCHITECTURE.md#vision-pipeline) for internals. Contract:
 
-- Input: raw image bytes (normalized to PNG, max 1568px on longest side).
-- Output: `ImageAnalysis(kind, description, mermaid)`. `mermaid` is `None` if the model didn't produce one, or produced one that failed validation and autofix and retry.
-- `kind` ∈ `{"diagram", "photo", "chart", "screenshot", "illustration", "other"}`.
-- `description` is 2–5 sentences in the output language named in the context (PDF: the document's language, see §7), default Bahasa Indonesia. Always populated.
-- `silent=True` (decorative, too small, or a repeat of an image already described) → `to_markdown_block()` returns `""` and converters emit nothing.
+- Input: raw image bytes (normalized to PNG, max 1568px on longest side; transparency kept — a palette PNG with a transparent background is uploaded as RGBA, never flattened to black).
+- Output: `ImageAnalysis(kind, description, mermaid, table, text)`. `mermaid` is `None` if the model didn't produce one, or produced one that failed validation and autofix and retry.
+- `kind` ∈ `{"diagram", "photo", "chart", "table", "text", "screenshot", "illustration", "decorative", "other"}`.
+- `description` is 2–5 sentences in the output language named in the context (PDF: the document's language, see §7), default Bahasa Indonesia. Always populated. For `table` and `text` it is one sentence; the content itself is in `table` / `text`.
+- `table` (2026-09-30): for `kind == "table"`, every row and column as GitHub Markdown, cells copied exactly (digits, decimal commas, `…`, `–`). Normalized by `_finalize_table`: header + `---` row required, short rows padded, a row wider than its header rejects the answer → one retry with a hint. Side-by-side halves with an identical header (`| Year | Value | Year | Value |`) are stacked into one table. Rendered under the description.
+- `text` (2026-09-30): for `kind == "text"` (a paragraph or list pasted as a picture), the text word for word, lists as Markdown. Rendered under the description.
+- The model answers in five `---`-separated sections: `KIND` / `DESCRIPTION` / `TABLE` / `TEXT` / `MERMAID`. Older three-section answers still parse.
+- Guards against small local models (2026-09-30), applied to every provider: an answer that repeats a 50-character run of the slide text given as context (`Teks slide: …`) is retried once with a warning and dropped silently if it copies again; a description that says "tabel"/"table" under another kind is retried with the table hint; a description opening with "Logo …" / "Gambar ini menampilkan logo …" makes the picture `decorative`; a second `| --- |` row inside a table is not data.
+- `silent=True` (decorative — by the local heuristic or because the model answered `kind: decorative` for a logo, icon or ornament —, too small, or a repeat of an image already described) → `to_markdown_block()` returns `""` and converters emit nothing.
 
 **Page transcription contract** (PDF page vision, 2026-09-27): `transcribe_page(png_bytes, text_layer, extra_context) -> PageTranscription(markdown, coverage, retried, invalid_mermaid, input_tokens, output_tokens)`. Implemented by every built-in client; `is_local` tells the converter whether the model is offline (Ollama). See [PDF § Page vision](#pdf).
 
@@ -136,38 +140,44 @@ The OCR path uses the **raw** AI client (bypasses the image dedup/skip filters) 
 
 **Library**: python-pptx.
 
-**Slide iteration**: `presentation.slides` in slide order. Each slide → `## Slide <n>` header, then title if present as bold text, then content, then layout description as block-quote, then image analyses (if any).
+**Output per slide** (reworked 2026-09-30): `## <slide title>` (or `## Slide <n>` when a slide has no title), the slide's content in reading order, `### Notes` if the slide has speaker notes, then `---` between slides. No layout lines, no placeholders, no page numbers.
 
-**Text extraction**: only from placeholders and text frames whose text is non-empty. Order: top-to-bottom, then left-to-right. Multi-paragraph text frames become bulleted lists.
+**Shape model** (`converters/pptx_shapes.py`): every shape flattened out of groups with its box in slide EMU — group transforms (`a:off/a:ext/a:chOff/a:chExt`) applied, because python-pptx reports a grouped shape's offset in the group's child space — its `cNvPr` id, drawing order, kind (text, picture, table, chart, connector, shape) and placeholder role. Text on one line has soft breaks (`\v`, `<a:br/>`) turned into spaces; a raw `\v` never reaches the output.
 
-**Placeholders skipped**: slide number (idx 15) and footer (idx 16). Title placeholder handled separately (emitted bolded before content).
+**Title** (`pptx_layout.find_title`): the title placeholder; else the text in the top quarter whose largest run font is the largest on the slide and ≥ 18 pt (decks often use a plain text box called "Title 7").
 
-**Tables**: `shape.has_table` — emitted as Markdown table with pipe-escape on cell text.
+**Dropped**: slide-number, footer and date placeholders (by placeholder *type*), and page-number text boxes — `Hal. 3`, `Page 2 of 9`, a bare number — in the top 15% or bottom 20% of the slide.
 
-**Charts** (native PPTX charts, added 2026-09-21): any shape with `has_chart == True` is emitted as `### Chart: <title>` followed by a markdown table with `Category` as the first column and one column per series (from `chart.plots[0].categories` and `series.values`). **No AI call** — chart data is deterministic and models often misread axes. Numeric values are trimmed of trailing zeros. Chart-shape presence also disables the shape-diagram detector for the slide (charts + connectors would otherwise false-trigger it).
+**Paragraphs** (`pptx_layout.frame_markdown`): the real list structure of each text frame.
+- `a:buAutoNum` → numbered item (`startAt` honoured; alpha/roman schemes become `- a.` text since Markdown lists only number with digits); `a:buChar` → `-`; `a:buNone` → paragraph. No bullet element: body placeholders inherit bullets, text boxes do not.
+- Hand-typed `2.   Text` → numbered item 2. Numbering continues across unnumbered lines, as PowerPoint does.
+- Depth from the marker position `marL + indent` (hanging indents cancel out), bucketed within 60 000 EMU; four spaces per level.
+- A plain paragraph right after a list item that is indented further (by `marL` or by leading spaces) continues that item: it is indented under the item's text.
+- A plain paragraph whose runs are all explicitly bold → `**text**`.
 
-**Speaker notes** (added 2026-09-21): if `slide.has_notes_slide` and the notes text frame is non-empty, emitted as `### Notes` + body at the end of the slide, before the `---` separator. Often the actual decision context lives here rather than on the deck.
+**Reading order** (`pptx_layout.reading_order`): recursive XY-cut over the blocks (text frames, tables, charts, pictures, the flowchart) — split at the widest clear gap, columns or rows, recurse. A two-column slide reads down the left column, then down the right, instead of line by line across both.
 
-**Layout description**: block-quote `> **Layout:** '<layout_name>' — <counts>` where counts is `N text, N picture, N table, N chart, N shape`.
+**Tables**: native tables → Markdown table (cells cleaned, pipes escaped). **Charts**: data from `chart.plots[0]` → `**Chart: <title>**` + table (categories × series). No AI call for either.
 
-**Pictures**: any `MSO_SHAPE_TYPE.PICTURE`. Order after text/table/chart/layout.
+**Flowcharts** (`pptx_shape_mermaid.extract_flow`): the graph straight from the XML, no AI.
+- Each connector's ends resolve to the shape it is glued to (`a:stCxn` / `a:endCxn` id) or else to the smallest text shape whose box (±1.5% of slide width) holds the end point. Text boxes are nodes as much as auto-shapes are.
+- Direction from the arrowheads: `a:tailEnd` sits at the end point, `a:headEnd` at the begin point; head-only reverses the edge; `type="none"` on both → undirected (`---`); no arrow information at all → begin → end (python-pptx default connectors).
+- Block arrows (`downArrow`, `rightArrow`, …) link the nearest box behind to the nearest box ahead, within 12% of the slide.
+- A text box of ≤ 24 characters within 8% of slide width of a connector's midpoint is its label (`-->|ya|`).
+- Needs ≥ 2 edges. Nodes in flow order; labels quoted (`n1["…"]`); shape → brackets: `roundRect` `(["…"])`, `diamond` `{"…"}`, `ellipse` `(("…"))`. Consumed shapes (nodes, connectors, arrows, labels) leave the text flow.
+- Shape diagrams whose connectors resolve to nothing (≥ 3 shapes, ≥ 1 connector, no picture or chart) still go through the old raster + VLM pass (`slide_render.render_slide_shapes`).
 
-**Author Alt Text passthrough** (added 2026-09-21): before calling the AI, each picture's `<p:cNvPr descr="…">` attribute is read. If the alt text is ≥ 12 chars (author actually filled it in, not the auto-generated "Picture 3" default), it is emitted as the narration verbatim and **the AI call is skipped**. Rationale: the author's own words are more credible than an AI paraphrase and cost nothing. Alt-text blocks use a distinct header (`> **[Gambar dalam dokumen asli — alt text penulis]**`) so they're distinguishable from AI-generated blocks in post-processing.
+**Pictures**:
+- **Author Alt Text passthrough** (2026-09-21): alt text (`<p:cNvPr descr>`) of ≥ 12 characters is emitted as `> **Gambar (alt text penulis):** …` and the AI is skipped. Alt text Office wrote itself does not count (2026-09-30): "Description automatically generated" / "Deskripsi dibuat secara otomatis" descriptions and file names go to the AI.
+- Dropped without an AI call: pictures marked decorative (`<adec:decorative val="1"/>`) and Office library icons (an SVG picture — `asvg:svgBlip` — whose alt text is still the icon name, `Bullseye outline`).
+- **Text boxes on top of a picture** (≥ 80% inside it, later in drawing order — e.g. a word patched over a bitmap): they leave the text flow and the picture is analysed as a crop of the rendered slide, so the AI reads what the viewer sees ("Bagi Peserta Aktif", not the "Pensiun" underneath).
+- Everything else is analysed with the slide title, some slide text and the document language as context (see §2.2): tables and pictures of text come out as their content, logos/icons silently disappear, other pictures as one `> **Gambar (kind):**` line (+ Mermaid for a diagram).
 
-**AI extra_context enrichment** (added 2026-09-21): when the AI is called for a picture or shape-diagram, `extra_context` includes the slide title and up to ~300 chars of surrounding body text (joined with ` | `). Improves narration accuracy and Mermaid label choice by giving the vision model textual grounding, not just pixels.
-
-**Shape diagrams** (native PPTX shape + connector graphs, no bitmap):
-
-- Detection: `_looks_like_shape_diagram(shapes)` = at least 3 AUTO_SHAPE **and** at least 1 LINE (connector) **and** no PICTURE **and no CHART** on the slide.
-- **First pass — direct Mermaid extraction** (`pptx_shape_mermaid.try_extract_mermaid`, added Sprint 4 E1, 2026-09-21):
-  - Enumerate auto-shapes → nodes with `text_frame.text` as label. Shape style → Mermaid node syntax: `RECTANGLE` → `[label]`, `ROUNDED_RECTANGLE` → `([label])`, `DIAMOND`/`FLOWCHART_DECISION` → `{label}`, `OVAL`/`FLOWCHART_CONNECTOR` → `((label))`, `FLOWCHART_TERMINATOR` → `([label])`.
-  - Enumerate LINE connectors → edges. Endpoints (`begin_x/y`, `end_x/y`) matched to node bboxes with ±0.1 inch tolerance; if no bbox contains an endpoint, nearest-center match within 3× tolerance is used.
-  - Small standalone text boxes (≤24 chars) near connector midpoints (within 0.75 inch) become edge labels (`-->|Yes|`).
-  - Direction: `LR` if ≥50% of edges are more horizontal than vertical, else `TD`.
-  - Rejected (falls back to raster+VLM) if: <2 nodes, no edges, or <50% of nodes have any edge.
-  - When it succeeds: zero AI cost, 100% correct labels. Fixture `shape_diagram.pptx` converts in ~10ms.
-- **Fallback pass — raster + VLM**: if direct extraction returns `None`, rasterize the slide via `slide_render.render_slide_shapes()` → PNG → AI.
-- Rasterizer supports: rectangle, rounded rectangle, oval, diamond, and connectors. Fidelity is intentionally rough — the goal is "recognizable by a VLM," not pixel-perfect.
+**Slide vision** (`pptx_slide_vision`, env `ANYTOMD_PPTX_SLIDE_VISION`, GUI "Slide → AI per halaman / PPTX"; `auto` = cloud provider and `image_mode != none`, `always`, `never`):
+- Each slide is rendered — PowerPoint through COM when installed (`pptx_render.render_with_powerpoint`: PowerShell, read-only, no window, quits PowerPoint only if nothing else is open; ~4 s for 7 slides), else a PIL approximation (`render_with_pil`: fills, borders, pictures, wrapped text, connectors with arrowheads, block arrows, in drawing order). `ANYTOMD_PPTX_RENDERER=auto|powerpoint|pil`.
+- The text layer (§ PDF page vision format) holds the title and each text frame's Markdown with its real numbering, at its position. Tables, charts, pictures and the flowchart enter as `[[TABLE n]]`, `[[CHART n]]`, `[[PICTURE n]]`, `[[DIAGRAM n]]`, listed again under `PLACEHOLDERS` with a short description. Connectors that do not form a flowchart are listed as `CONNECTORS` hints.
+- The model's answer passes the page-vision checks (coverage, invented words, Mermaid → one retry). Then the placeholders are filled with the exact content; a placeholder the model left out is appended; a table or Mermaid block the model reproduced on its own is dropped; a missing `##` title is added.
+- Coverage still below 92% after the retry, or an API error → that slide uses the deterministic output. Stats: `page_vision_*`.
 
 ### DOCX
 
@@ -228,6 +238,10 @@ Simple pass-through to AI. Output structure:
 
 <description>
 
+## Tabel                  ← only if a table was transcribed (replaces the Mermaid section)
+
+<table>
+
 ## Diagram (Mermaid)      ← only if mermaid produced
 
 ```mermaid
@@ -235,7 +249,7 @@ Simple pass-through to AI. Output structure:
 ```
 ```
 
-If the AI returns no valid Mermaid, the Mermaid section is replaced by `*(Bukan diagram struktural — tidak ada Mermaid yang dihasilkan.)*`.
+If the AI returns neither a table nor valid Mermaid, that section is replaced by `*(Bukan diagram struktural — tidak ada Mermaid yang dihasilkan.)*`. A standalone image is always described, even when the model calls it decorative.
 
 ### HTML (.html, .htm)
 
@@ -296,7 +310,9 @@ The `OptimizedAIClient` wrapper (in `ai_client.py`) enforces filters in this ord
 4. **Diagram-only** (`image_mode="diagrams_only"`) — run `image_heuristics.looks_like_diagram()`. Passing signals (any one): ≤20 distinct colors, ≥55% near-white pixels, or ≥6% edge density. Tuned to lean toward keeping (false positives waste one AI call; false negatives lose a diagram — the worse failure mode).
 5. **Dedup** (`image_dedup=True`) — SHA-256 of image bytes. First occurrence goes through, result cached; subsequent identical bytes reuse the cached analysis. Cache is per-conversion (fresh cache per file).
 
-Skipped images produce the compact placeholder above instead of the full `> **[Gambar dalam dokumen asli — ...]**` block — except **silent** skips (2026-09-27): decorative, too small (bytes or px), and duplicates emit nothing at all (a duplicate was already described at its first occurrence). Placeholders remain for choices the user made (`mode: none`, `diagrams_only`) and for the budget cap. Stats (sent / skipped_tiny / skipped_duplicate / skipped_not_diagram / skipped_mode_none / skipped_decorative / skipped_template) are accumulated on `ConvertOptions._stats` and shown in the GUI status bar after conversion.
+Decorative checks (with `skip_decorative`, default on), before step 4: icon-sized pictures (longest side ≤ 128 px, `is_icon_sized`) are skipped silently — too small to carry readable content, and small models invent diagrams from them; then `image_heuristics.is_decorative()` (a transparent image is flattened onto white **and** onto black and must look decorative on both — a bare `convert("RGB")` turns a transparent background black and made black text look like a solid block, 2026-09-30; the 1px frame `FIND_EDGES` leaves unfiltered is cropped before counting edges). Then a **perceptual hash** (`perceptual_hash`: 256-bit dHash of the content box after trimming plain borders, plus aspect ratio): a picture matching one the model already answered `kind: decorative` for is skipped silently — the same logo re-exported per slide with another crop or size has different bytes, so SHA-256 dedup misses it (measured: same logo ≤11 bits apart, different pictures ≥100; threshold 24). Stats: `skipped_decorative` (local) and `ai_decorative` (sent, answered decorative, nothing written).
+
+Skipped images produce the compact placeholder above instead of the `> **Gambar (…):**` line — except **silent** skips (2026-09-27): decorative, too small (bytes or px), and duplicates emit nothing at all (a duplicate was already described at its first occurrence). Placeholders remain for choices the user made (`mode: none`, `diagrams_only`) and for the budget cap. Stats (sent / skipped_tiny / skipped_duplicate / skipped_not_diagram / skipped_mode_none / skipped_decorative / skipped_template) are accumulated on `ConvertOptions._stats` and shown in the GUI status bar after conversion.
 
 **Measured impact** on `tests/fixtures/dedup_test.pdf` (6-page PDF with a 32×32 logo repeated on every page + 1 real diagram = 7 image occurrences):
 

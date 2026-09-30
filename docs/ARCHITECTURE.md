@@ -118,7 +118,7 @@ flowchart TB
 | `anytomd/config.py`                       | Loads `.env` from project root, then keyring, then env vars. Exposes `Config` dataclass with per-provider fields (Anthropic, OpenAI, Gemini, Moonshot, Ollama). `provider_for_kind()` implements hybrid routing lookup. `key_source()` returns `"env"`/`"keyring"`/`"missing"` for GUI display. `cost_per_call()` returns cost estimate per provider. |
 | `anytomd/keystore.py`                     | Thin `keyring` wrapper: `get_key/set_key/delete_key/backend_name`. Uses OS-native store (Windows Credential Manager on Windows via DPAPI). Graceful degradation if no backend. |
 | `anytomd/ai_client.py`                    | 5 provider clients: `AnthropicClient`, `OpenAIClient`, `MoonshotClient(OpenAIClient)`, `GeminiClient`, `OllamaClient`, each with `analyze_image` (describe) and `transcribe_page` (page vision) over one `_complete(png, system, user_text, max_tokens)`; `is_local` marks Ollama. `HybridAIClient` classifies per image (local heuristic) → routes → tracks cost per provider → falls back on error; page vision follows the *diagram* route. `OptimizedAIClient` wraps for dedup + skip-tiny + decorative filter + full-skip mode; filtered results are `silent`. Mermaid parse/validate/autofix/retry pipeline shared by all providers. Page vision: `PAGE_SYSTEM` prompt, `format_text_layer_entry`, `page_coverage`, `added_words`, `_transcribe_page_with_retry`. |
-| `anytomd/options.py`                      | `ConvertOptions` dataclass: image filters, decorative skip, OCR mode/engine/lang, `pdf_page_vision`. `_stats` dict accumulates counters + est_cost_usd + page-vision coverage/tokens for GUI status bar. |
+| `anytomd/options.py`                      | `ConvertOptions` dataclass: image filters, decorative skip, OCR mode/engine/lang, `pdf_page_vision`, `pptx_slide_vision`. `_stats` dict accumulates counters + est_cost_usd + page-vision coverage/tokens for GUI status bar. |
 | `anytomd/lang.py`                         | `detect_language(text)` — English / Bahasa Indonesia by stopword counts, Arabic by script share. Used to ask for image descriptions in the document's language. |
 | `anytomd/image_heuristics.py`             | Zero-cost local classifiers: `is_decorative()` (solid blobs), `looks_like_diagram()` (diagram-only prefilter), `classify_image()` (returns `decorative`/`photo`/`chart`/`screenshot`/`diagram`/`unknown` for hybrid routing). |
 | `anytomd/slide_render.py`                 | PIL rasterizer for PPTX native shapes — fallback when direct XML extraction can't recover the graph. |
@@ -126,8 +126,11 @@ flowchart TB
 | `anytomd/converters/__init__.py`          | Dispatcher: extension → `convert_*` function. Wraps `ai` with `OptimizedAIClient` per-conversion. |
 | `anytomd/converters/pdf.py`               | PyMuPDF `get_text("dict")` for spans+fonts. pdfplumber tables with column-collapse + disjoint-merge + text-strategy fallback (whole-word cells via `_table_from_words` when the bbox cuts words). Heading detection via font-size clustering + numbering regex. Paragraph merge across blocks. Nested bullets from x-indent. Cover-page skip. PDF outline passthrough. Painted-only images (`_drawn_images`), template-image skip, images placed by y. Screenshot OCR via `_ocr_screenshot_if_possible`. Slide-deck detection (`_is_slide_deck`) and page vision (`_use_page_vision`, `_run_page_vision`: render + text layer + vector hints, 4 pages in parallel, per-page fallback). |
 | `anytomd/converters/pdf_vector.py`        | Reads the page's vector drawing for page vision: boxes (style = border colour, fill, dashed), legend swatches with their labels, connectors with arrowheads and badge labels. Returns per-text-block tags (`{legend: X}` / `{box Sn}`) and a BOX STYLES + CONNECTORS appendix. |
-| `anytomd/converters/pptx.py`              | Slide walk. Native chart → markdown table. Speaker notes. Author Alt Text passthrough. Shape-diagram branch: first tries `pptx_shape_mermaid.try_extract_mermaid` (direct XML), falls back to raster+VLM. |
-| `anytomd/converters/pptx_shape_mermaid.py`| E1: enumerate auto-shapes → nodes, LINE connectors → edges, textbox labels near midpoints → edge labels. Returns Mermaid `flowchart LR/TD` or `None` (caller falls back to raster). |
+| `anytomd/converters/pptx.py`              | Orchestrator (reworked 2026-09-30). `_prepare` builds each slide's blocks from the XML (title, paragraphs, tables, charts, pictures with their overlays, flowchart); `_analyze_pictures` (alt text, decorative/icon skip, crop of the render when text is patched on top, AI); deterministic output via `reading_order`; slide vision (`_use_slide_vision`, `slide_text_layer` with `[[PICTURE n]]`-style placeholders, `_run_slide_vision` 4 in parallel, `finish_slide_markdown` fills placeholders / drops model copies / adds `##`; coverage < 92% or error → deterministic). Speaker notes, native charts. |
+| `anytomd/converters/pptx_shapes.py`       | `collect_shapes(slide)` → `ShapeInfo` per shape: groups flattened with their transforms applied, box in slide EMU, `cNvPr` id, drawing order, kind, placeholder role, connector ends. `clean_text` turns soft breaks into spaces. |
+| `anytomd/converters/pptx_layout.py`       | Deterministic layout: `find_title` (placeholder or largest top text), `is_page_number`, `frame_markdown` (real bullets/numbering from `buAutoNum`/`buChar`/hand-typed numbers, depth from `marL+indent`, continuations, bold paragraphs), `table_markdown`, `find_overlays`, `reading_order` (XY-cut). |
+| `anytomd/converters/pptx_shape_mermaid.py`| `extract_flow` / `resolve_edges`: connectors resolved via `stCxn`/`endCxn` or box hit (text boxes count as nodes), arrowheads for direction, block arrows, midpoint labels → `Flow` with `mermaid()` and `hint_lines()`. `try_extract_mermaid` kept as a wrapper. |
+| `anytomd/pptx_render.py`                  | Slide images: `render_with_powerpoint` (COM via PowerShell, read-only, all slides in one session), `render_with_pil` (fills, borders, pictures, wrapped text, connectors, block arrows), `crop_box`. `ANYTOMD_PPTX_RENDERER`. |
 | `anytomd/converters/docx.py`              | python-docx body walk (paragraphs + tables interleaved); heading/list detection; inline image extraction. |
 | `anytomd/converters/xlsx.py`              | openpyxl sheet iteration; cell rendering; trim + cap. |
 | `anytomd/converters/html.py`              | beautifulsoup4 + markdownify. Strips `<script>/<style>/<nav>/<footer>/<aside>`; drops anchors on link-heavy pages. |
@@ -265,29 +268,34 @@ Runs to a fixed point (max 5 iterations) in this order per iteration:
 
 Fires only when `kind == "diagram"`, raw Mermaid was non-`NONE`, and post-autofix mermaid is still `None`. Retry sends a second AI call with the previous invalid Mermaid + failure reasons appended to context.
 
-## PPTX shape-diagram flow
+## PPTX pipeline (2026-09-30)
 
 ```mermaid
 flowchart TD
-    A[Slide element] --> B{_visible_shapes}
-    B --> C{has PICTURE or CHART?}
-    C -->|yes| D[Normal flow:<br/>text + tables + chart + layout desc<br/>+ analyze each picture]
-    C -->|no| E{≥3 AUTO_SHAPE<br/>AND ≥1 LINE?}
-    E -->|no| D
-    E -->|yes| F[Shape-diagram branch]
-    F --> G[Skip text extraction from shapes]
-    G --> H{try_extract_mermaid}
-    H -->|success| I[Emit direct Mermaid<br/>zero AI call]
-    H -->|None| J[slide_render.render_slide_shapes]
-    J --> K[PNG bytes]
-    K --> L[ai.analyze_image with<br/>extra_context 'shape diagram']
-    L --> M[Mermaid pipeline]
-    M --> N[Emit ImageAnalysis block]
+    A[Slide] --> B[collect_shapes<br/>groups flattened, EMU boxes]
+    B --> C[find_title · page numbers dropped]
+    B --> D[extract_flow<br/>connectors + block arrows → Mermaid]
+    B --> E[frame_markdown per text frame<br/>real bullets and numbering]
+    B --> F[pictures + overlays]
+    F --> G{text patched on top?}
+    G -->|yes| H[crop of the slide render]
+    G -->|no| I[picture blob]
+    H --> J[analyze_image]
+    I --> J
+    J --> K[blocks: text · table · chart · picture · diagram]
+    D --> K
+    E --> K
+    C --> K
+    K --> L{slide vision?<br/>cloud provider}
+    L -->|no| M[reading_order XY-cut → Markdown]
+    L -->|yes| N[render slide<br/>PowerPoint or PIL]
+    N --> O[transcribe_page with text layer<br/>+ PLACEHOLDER tokens]
+    O --> P{coverage ≥ 92%?}
+    P -->|yes| Q[finish_slide_markdown<br/>fill tokens, drop copies]
+    P -->|no / error| M
 ```
 
-Text extraction is intentionally skipped in the shape-diagram branch because otherwise the shape labels ("Commit", "Build", …) would appear twice.
-
-`try_extract_mermaid` succeeds most of the time on well-formed PPTX shape diagrams — see `pptx_shape_mermaid.py` for the matching heuristics (endpoint→node bbox lookup, textbox label proximity, direction inference from edge orientation).
+The pieces that carry content — text, tables, charts, flowchart, transcribed pictures — are always taken from the file; slide vision only decides structure (headings, panels, reading order). A shape diagram whose connectors resolve to nothing still goes through the old raster + VLM pass (`slide_render.render_slide_shapes`).
 
 ## PDF pipeline (post-Sprint 1-2 refactor)
 

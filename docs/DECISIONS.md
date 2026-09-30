@@ -397,3 +397,31 @@ All rarely-changed config (API keys, hybrid routing, model IDs, base URLs, cost 
 **Decision**: `ImageAnalysis.silent` — decorative, too small, template (painted on ≥50% of pages), and repeats of an already-described image produce no Markdown. Placeholders stay where the user made a choice (`mode: none`, `diagrams_only`) or a limit hit (budget cap). Counts remain in the stats line.
 
 **Consequences**: Output of the dedup fixture shrinks to text + one diagram. Anyone who wants to see every skip can still read the stats; a verbose mode can come back if asked.
+
+## 2026-09-30 — Pictures of tables and text are transcribed; logos and icons are judged by the model
+
+**Context**: A real 7-slide PPTX (numeric lookup tables pasted as bitmaps) came out with the key content missing: each table became a 3-sentence summary (a range and a trend instead of the values; one summary even misstated the row intervals), a key paragraph — black text on a transparent PNG — was skipped as "decorative", two logos were described at length on every slide, and PowerPoint's own icon name `Bullseye outline` was emitted as author alt text.
+
+**Decision**:
+- The describe prompt gets two content sections next to `MERMAID`: `TABLE` (every row and column, exact cells) and `TEXT` (a picture of text, word for word). A table answer without a valid table retries once, like Mermaid. Side-by-side halves with the same header are stacked in code, since the model does not reliably do it.
+- `kind: decorative` from the model (logo, icon, pictogram, ornament) is silent. Its perceptual hash is remembered, so the same logo with another crop on later slides costs no call.
+- Transparency is kept for upload and flattened properly for heuristics (white and black).
+- PPTX: Office-generated alt text is not trusted; library icons and pictures marked decorative are dropped locally.
+
+**Alternatives considered**: a position heuristic for logos (small picture in the header/footer band) — cheaper, but guesses about layout drop real content in the band; the model sees the picture. Tesseract cross-check of table digits — the tables are small, low-resolution bitmaps where OCR noise would trigger needless retries; the real deck was checked by hand instead (72/72 rows exact).
+
+**Consequences**: One `DESCRIBE_MAX_TOKENS = 4096` (was 2048) so a 40-row table fits; Ollama keeps its larger context only for page transcription. A logo still costs one call at its first appearance. The icon regex is English (`outline` / `with solid fill`); icons inserted from a localized Office go to the model, which should answer decorative.
+
+## 2026-09-30 — PPTX: layout from the XML, slide vision with placeholders
+
+**Context**: Compared with a direct Kimi read of the same 7-slide deck, AnyToMD had every word but no structure: `## Slide N` and the title as plain text, `> Layout:` / `*(Placeholder: …)*` lines (107 words that are not on the slides), every multi-paragraph frame flattened to `-` bullets (auto numbering lost, "2." typed by hand kept as text), two-column slides read line by line across both columns, the soft line break `\v` written as an invisible character (the two words around it glued together), and a flowchart of bordered text boxes emitted as loose lines — the shape-diagram path only ran on slides without pictures and only took auto-shapes as nodes. Both tools also missed that the slide patches a text box with another word over one word of a bitmap sentence. Kimi in turn reordered a slide, paraphrased, invented headings and dropped the slide-3 title.
+
+**Decision**:
+- Deterministic layout from the XML (`pptx_shapes`, `pptx_layout`): real titles, real list structure (`buAutoNum`, `buChar`, hand-typed numbers, depth from `marL + indent`, continuations), XY-cut reading order, page-number boxes and number/footer/date placeholders dropped, soft breaks as spaces. No layout or placeholder lines; image blocks shrink to their content (tables, text) or one `> **Gambar (kind):**` line.
+- Flowcharts straight from the connectors (`extract_flow`): glue ids first, box hit second, arrowheads for direction, block arrows, midpoint labels; text boxes are nodes. Runs on every slide, pictures or not.
+- Text boxes on top of a picture belong to the picture: it is analysed as a crop of the rendered slide.
+- Slide vision for cloud providers: rendered slide (PowerPoint via COM when available — the box has Office, no LibreOffice — else a PIL approximation) + text layer. Everything whose content is already exact (tables, charts, pictures, flowchart) enters as a `[[KIND n]]` placeholder and is filled in afterwards, so the model only decides structure; its copies of that content are dropped; below 92% coverage after the retry the slide keeps the deterministic output.
+
+**Alternatives considered**: PPTX → PDF via PowerPoint and reuse the PDF page-vision path as is — least new code, but loses the XML's exact lists, connector ids and picture blobs, needs PowerPoint for every PPTX, and table bitmaps would be re-read from a downscaled page render. Letting the model transcribe tables/pictures inside slide vision — cheaper by the picture calls, but the verified per-picture transcription is more reliable than a second read from the full slide. `pywin32` for COM — PowerShell is always there and avoids COM apartment handling in the worker thread.
+
+**Consequences**: With the default settings the deck converts in ~85 s (10 picture calls + 7 slide calls, ~22k input tokens for the slides); word-level: 877/877 slide words, 0 invented, the patched sentence right, the flowchart edge for edge. Without a cloud model (Ollama, or `never`) the deterministic path gives the same words and flowchart with flatter headings. PowerPoint must not be busy with a modal dialog; any failure falls back to PIL for the rest of the process. The PIL render ignores gradients, theme colours beyond `bg1/tx1`, rotation and picture cropping (`srcRect`).

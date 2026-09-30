@@ -25,7 +25,7 @@ emitted ~740 image placeholders. See [DECISIONS](DECISIONS.md) 2026-09-27.
 - Tests: `tests/run_pdf_unit.py` (offline, 44 checks), `tests/run_page_vision_smoke.py` (cloud), fixture `slide_deck.pdf`.
 
 **Still open from this work:**
-- PPTX/DOCX image descriptions still default to Bahasa Indonesia (language detection only wired into PDF).
+- ~~PPTX/DOCX image descriptions still default to Bahasa Indonesia~~ — resolved 2026-09-30: both pass the detected document language.
 - Slide decks with Ollama use the text path: better than before, but vector diagrams and borderless tables are still flat text there. Try `ANYTOMD_PDF_PAGE_VISION=always` with a stronger local VLM if one becomes available.
 - `.odp` input is not supported (the decks that prompted this came from Impress); PPTX input gives better results than its PDF export.
 
@@ -145,7 +145,11 @@ if len(sys.argv) > 1 and not sys.argv[1].startswith("--gui"):
 return gui.run()
 ```
 
-### 7. PowerPoint COM renderer as opt-in
+### 7. ~~PowerPoint COM renderer as opt-in~~
+
+**Resolved 2026-09-30** — `anytomd/pptx_render.py` drives PowerPoint through PowerShell (no pywin32): one read-only session exports every slide, PowerPoint is quit only if nothing else is open, any failure falls back to the PIL renderer for the rest of the process. Used by PPTX slide vision and for pictures with text patched on top. `ANYTOMD_PPTX_RENDERER=auto|powerpoint|pil`.
+
+*Original note:*
 
 If the user has Office (this box does), we can use `pywin32` to drive PowerPoint to export a slide to PNG. Higher fidelity than our PIL renderer for complex slides. Behind an env flag: `ANYTOMD_PPTX_RENDERER=powerpoint` else falls back to PIL.
 

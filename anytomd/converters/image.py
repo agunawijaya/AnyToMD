@@ -40,7 +40,12 @@ def convert_image(path: Path, ai: AIClient, progress: ProgressFn | None = None) 
     out.append("")
     out.append(analysis.description.strip())
     out.append("")
-    if analysis.mermaid:
+    if analysis.table:
+        out.append("## Tabel")
+        out.append("")
+        out.append(analysis.table.strip())
+        out.append("")
+    elif analysis.mermaid:
         out.append("## Diagram (Mermaid)")
         out.append("")
         out.append("```mermaid")

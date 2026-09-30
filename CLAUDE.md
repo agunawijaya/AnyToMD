@@ -10,7 +10,7 @@
 
 Supported inputs → single `.md` output:
 - **PDF** (text + strip header/footer/page#; describes embedded images)
-- **PPTX** (slide text, layout, tables, pictures; **shape diagrams rasterized** with PIL then AI-analyzed)
+- **PPTX** (titles, real lists, columns in order, tables, charts, notes; **flowcharts → Mermaid from the connectors**; pictures transcribed/described; cloud: **slide vision** for structure)
 - **DOCX** (headings, paragraphs, lists, tables, inline images)
 - **XLSX** (each sheet → `## Sheet: <name>` + MD table)
 - **PNG / JPG / WEBP / GIF / BMP** (AI description; Mermaid if diagram)
@@ -26,13 +26,15 @@ Five AI backends, selectable via GUI dropdown or `.env`:
 
 **Secure key storage** (2026-09-21): API keys can be stored via Windows Credential Manager (or macOS Keychain / Linux Secret Service) instead of `.env`. GUI has per-provider `Set…` / `Ubah…` / `Hapus` buttons. Precedence: env var (shell / `.env`) → keyring → empty. Module: `anytomd/keystore.py`.
 
-## Current state (2026-09-27, PDF slide decks)
+## Current state (2026-09-30, PPTX layout + slide vision)
 
 **Functional, end-to-end tested with Ollama and Anthropic, benchmarked against Microsoft markitdown and Claude-direct on a real 57-page RFP PDF** (AnyToMD surpasses both on heading count and table row capture, see `_bench/`) **and on two real slide decks exported to PDF** (page vision now on par with a direct Claude read; see [DECISIONS 2026-09-27](docs/DECISIONS.md)).
 
+- ✅ **PPTX rebuilt from the XML** (2026-09-30) — `## <title>` per slide (title placeholder or largest top text box), real bullets/numbering (`buAutoNum`, `buChar`, hand-typed "2.", depth from `marL+indent`, continuations), XY-cut reading order (columns), "Hal. N"/slide-number/footer dropped, `\v` → space, no Layout/Placeholder lines. Flowcharts of text boxes + connectors → Mermaid (`stCxn`/`endCxn`, arrowheads, block arrows, labels). Text patched over a picture → the picture is read from a crop of the rendered slide. **Slide vision** (cloud, `ANYTOMD_PPTX_SLIDE_VISION`): slide rendered by PowerPoint (COM via PowerShell) or PIL, the model structures it; tables/pictures/charts/flowchart go in as `[[PICTURE n]]` placeholders and are filled from the file; coverage < 92% → XML layout. Real 7-slide deck: 877/877 words, 0 invented, vs Kimi 99.2% / 11 invented. See [DECISIONS 2026-09-30](docs/DECISIONS.md).
 - ✅ **PDF slide decks → page vision** (2026-09-27) — deck detected by app name / screen ratio; with a cloud provider each page is rendered and transcribed by the vision model, anchored on the text layer + exact vector hints (`converters/pdf_vector.py`: legend colour per box, connectors with direction and badge labels). Checks: text coverage, invented words, Mermaid validity → one retry. `ANYTOMD_PDF_PAGE_VISION=auto|always|never`, GUI group "PDF slide → AI per halaman".
 - ✅ PDF images: only **painted** images count (`get_image_info`, not `get_images`), template images (on ≥50% of pages) skipped, images placed by y, skipped images **silent** (no placeholder lines), descriptions in the document's language (`anytomd/lang.py`).
 - ✅ PDF text-strategy tables rebuilt from whole words when pdfplumber's bbox cuts words (CoverGo lost 1.3% of its words before).
+- ✅ **Pictures of tables / text are transcribed** (2026-09-30) — the describe prompt has `TABLE` and `TEXT` sections: a bitmap table comes out as a full Markdown table (side-by-side halves stacked), a picture of a paragraph word for word. Logos/icons: the model answers `kind: decorative` → silent, and a perceptual hash skips the same logo on later slides without a call. PPTX: Office-generated alt text (`Bullseye outline`, "…automatically generated") not trusted; library icons and pictures marked decorative dropped locally. See [DECISIONS 2026-09-30](docs/DECISIONS.md).
 
 - ✅ 6 converters implemented (`pdf`, `pptx`, `docx`, `xlsx`, `image`, `html`)
 - ✅ Two backends via factory + **hybrid router** (Sprint 3): route diagrams to Anthropic, photos to Ollama, all in one conversion
@@ -57,8 +59,9 @@ Five AI backends, selectable via GUI dropdown or `.env`:
 - ✅ Fixtures + smoke test script in `tests/`
 - ✅ Anthropic backend smoke-tested end-to-end (2026-09-27; key in Windows Credential Manager, `claude-sonnet-4-6`)
 - ✅ Offline PDF unit checks: `tests/run_pdf_unit.py` (44 checks, fake AI) + cloud smoke `tests/run_page_vision_smoke.py`
+- ✅ Offline image + PPTX checks: `tests/run_pptx_unit.py` (73 checks, fake models, fixtures `pictures.pptx` + `layout.pptx`, renderer forced to PIL)
 - ⚠️  GUI code compiles but **not automated-tested** (Qt GUIs hard to headless-test; `OptionsPanel` is instantiated offscreen in checks, `QT_QPA_PLATFORM=offscreen QT_QPA_FONTDIR=C:/Windows/Fonts` renders a readable screenshot)
-- ⚠️  Slide decks with **Ollama** still use the text path (vector diagrams / borderless tables stay flat); PPTX/DOCX image descriptions still default to Bahasa Indonesia
+- ⚠️  PDF slide decks with **Ollama** still use the text path (vector diagrams / borderless tables stay flat). PPTX with Ollama uses the XML layout (same words and flowcharts, flatter headings); qwen can still misread table digits in pictures.
 
 ### Benchmark vs alternatives (CoverGo Proposal PDF, 57 pages)
 
@@ -91,14 +94,17 @@ E:\Projects\AnyToMD\
 │   ├── image_heuristics.py      # local diagram-vs-photo classifier
 │   ├── lang.py                  # document-language guess (descriptions in the doc's language)
 │   ├── ocr.py                   # Tesseract + PaddleOCR + AI-vision + Hybrid backends
-│   ├── slide_render.py          # PIL-based PPTX shape rasterizer
+│   ├── slide_render.py          # PIL-based PPTX shape rasterizer (fallback for unresolved shape diagrams)
+│   ├── pptx_render.py           # slide images: PowerPoint COM (PowerShell) or PIL; crops
 │   ├── gui.py                   # PySide6 desktop UI
 │   └── converters/
 │       ├── __init__.py                  # dispatcher by extension
 │       ├── pdf.py                       # PyMuPDF + pdfplumber + heading/para/list detection + page vision
 │       ├── pdf_vector.py                # vector hints for page vision: legend colours, connectors
-│       ├── pptx.py                      # python-pptx (+ chart/notes/alt-text)
-│       ├── pptx_shape_mermaid.py        # E1: shape XML → Mermaid deterministik
+│       ├── pptx.py                      # orchestrator: blocks, pictures, XML layout, slide vision
+│       ├── pptx_shapes.py               # shape geometry: groups flattened, EMU boxes, connector ends
+│       ├── pptx_layout.py               # titles, lists, page numbers, overlays, XY-cut reading order
+│       ├── pptx_shape_mermaid.py        # connectors + block arrows → Mermaid (extract_flow)
 │       ├── docx.py                      # python-docx
 │       ├── xlsx.py                      # openpyxl
 │       ├── html.py                      # beautifulsoup4 + markdownify
@@ -114,6 +120,7 @@ E:\Projects\AnyToMD\
     ├── make_fixtures.py         # generates fixtures/*.{png,pdf,pptx,docx,xlsx}
     ├── run_smoke.py             # forces Ollama, runs each converter
     ├── run_pdf_unit.py          # offline PDF checks (no AI): slide decks, page vision routing, validator
+    ├── run_pptx_unit.py         # offline image + PPTX checks (no AI): pictures, layout, flowcharts, slide vision
     ├── run_page_vision_smoke.py # page vision on slide_deck.pdf with a cloud provider
     ├── preview_render.py        # renders shape_diagram.pptx to PNG for inspection
     ├── fixtures/                # auto-generated inputs
@@ -144,8 +151,9 @@ python -m anytomd
 # Verify token-saving optimizations against the dedup fixture
 .venv\Scripts\python.exe tests\run_options_smoke.py
 
-# Offline PDF checks (no AI, must print ALL PASSED) + page vision with a cloud key
+# Offline PDF + image checks (no AI, must print ALL PASSED) + page vision with a cloud key
 .venv\Scripts\python.exe tests\run_pdf_unit.py
+.venv\Scripts\python.exe tests\run_pptx_unit.py
 .venv\Scripts\python.exe tests\run_page_vision_smoke.py
 ```
 
@@ -156,7 +164,7 @@ python -m anytomd
 - Model already pulled: **`qwen2.5vl:7b`** (6.0 GB, vision-capable)
 - Ollama server listens on `http://localhost:11434` (auto-started by Ollama Desktop)
 - Tesseract 5.5 at `E:\Program Files\Tesseract-OCR\tesseract.exe`, language packs installed: `ind`, `eng`, `osd`, `script\Arabic`
-- PowerPoint (Office16) installed at `C:\Program Files\Microsoft Office\root\Office16\POWERPNT.EXE` — currently **not used** by the app, but available if we later want higher-fidelity slide render than PIL
+- PowerPoint (Office16) installed at `C:\Program Files\Microsoft Office\root\Office16\POWERPNT.EXE` — used since 2026-09-30 to render PPTX slides (`pptx_render.py`, COM through PowerShell, ~4 s for 7 slides)
 - No LibreOffice on this box
 
 ## Configuration cheat sheet (`.env`)
@@ -193,6 +201,10 @@ ANYTOMD_OLLAMA_MODEL=qwen2.5vl:7b
 
 # PDF slide deck → AI per halaman: auto (slide deck + cloud) | always | never
 # ANYTOMD_PDF_PAGE_VISION=auto
+
+# PPTX → AI per slide (auto | always | never) dan renderer slide (auto | powerpoint | pil)
+# ANYTOMD_PPTX_SLIDE_VISION=auto
+# ANYTOMD_PPTX_RENDERER=auto
 ```
 
 ## When the user says "lanjutkan"
@@ -206,11 +218,14 @@ ANYTOMD_OLLAMA_MODEL=qwen2.5vl:7b
 
 - **`.env` loading** happens from the project root via `Path(__file__).parent.parent`, so the app works when launched from Start Menu shortcuts too. Do NOT change `config.py` to `load_dotenv()` bare — it would break launcher use.
 - **Mermaid quality on Ollama is inconsistent.** The safety-net pipeline (validate → autofix → retry) hides most VLM syntax bugs. If a diagram output looks wrong, first check `qwen2.5vl:7b` isn't the bottleneck — try `ANYTOMD_PROVIDER=anthropic` and see if it fixes.
-- **PPTX shape diagrams** are rasterized by our own PIL renderer (`slide_render.py`), not by PowerPoint or LibreOffice. Fidelity is intentionally rough — the goal is "recognizable enough for a VLM," not pixel-perfect. See [DECISIONS.md](docs/DECISIONS.md).
+- **PPTX content always comes from the XML; slide vision only structures it.** Tables, charts, pictures and the flowchart enter the slide-vision text layer as `[[PICTURE n]]`-style placeholders and are filled in afterwards (`finish_slide_markdown`). If a slide loses words, look at `slide_text_layer` for that slide before touching the prompt. Tests force `ANYTOMD_PPTX_RENDERER=pil` so they never start PowerPoint.
+- **PowerPoint rendering quits PowerPoint only if no other presentation is open**, and one failure disables it for the rest of the process (PIL takes over). A modal dialog in a running PowerPoint can make the export time out.
+- **Shell heredocs in this environment can unescape backslashes** (`\\b` arrived as a backspace, `\\v` as a vertical tab, `\root` as a carriage return). For code or docs with backslashes use the Edit/Write tools, then scan changed files for control characters.
 - **PPTX pictures with author Alt Text bypass the AI entirely.** Alt Text ≥ 12 chars is trusted and emitted verbatim with a distinct block header (`— alt text penulis`). If your PPT authors set good alt text, most images will never touch the model.
 - **PPTX native charts bypass the AI.** Categories + series values are read directly from `python-pptx` and emitted as a markdown table. Chart-shape presence also disables the shape-diagram detector on that slide (chart + connector would otherwise false-trigger it).
 - **PDF table detection needs visible rulings.** `pdfplumber.find_tables()` reads horizontal/vertical lines. Tables that rely on whitespace alignment (no borders) only come through the strict text-strategy fallback — otherwise the text falls through to normal paragraph extraction. On slide decks with a cloud provider, page vision recovers them.
 - **`page.get_images()` lies for slide exports.** It lists the page's *resources*; Impress/PowerPoint exports share one resource dictionary, so every page "has" every image of the deck. Use `_drawn_images` (`get_image_info`) for what is actually painted.
+- **Transparent PNGs: never `convert("RGB")` directly.** A palette PNG with a transparent background whose transparent entry is black becomes a solid black block (black text vanishes) — it made a slide's key paragraph look "decorative". Use `image_heuristics.load_rgb` (flattens onto a background) for heuristics; uploads keep the alpha (`_normalize_image`).
 - **Page vision checks are the safety net, keep them.** The model reliably misreads fine visual facts (dashed vs solid border, arrowhead direction) and occasionally adds explanatory sentences. Exact facts come from `pdf_vector.py`; coverage / invented-word / Mermaid checks trigger the retry. If output quality drops, look at the text layer the model received (`_run_page_vision` builds it) before touching the prompt.
 - **Client documents stay out of the repo.** `_bench/` is gitignored; tests use synthetic fixtures (`slide_deck.pdf` from `make_fixtures.py`). Don't quote client content in docs or test strings.
 - **`Path.write_text` on Windows writes CRLF.** The repo uses `core.autocrlf=true`, so it's harmless for git, but a Python one-off that edits files with a `\r` inside a string (e.g. `tests\run_…` in a non-raw string) plants a stray carriage return. Prefer the Edit tool for docs.

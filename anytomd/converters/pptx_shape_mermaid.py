@@ -1,227 +1,234 @@
-"""E1: Direct PPTX shape → Mermaid extraction (bypass VLM).
+"""PPTX shape flowchart → Mermaid, straight from the slide XML (no AI).
 
-For slides where the diagram is built from native PowerPoint shapes +
-connectors (not a bitmap), we can reconstruct the flow graph deterministically:
+A diagram built from native shapes and connectors carries its graph exactly:
 
-1. Enumerate auto-shapes → nodes. Text label = shape.text_frame.text.
-2. Enumerate LINE connectors → edges. Endpoint (x, y) matches the shape whose
-   bbox contains it → source. Same for the other endpoint → target.
-3. Nearby textboxes (small standalone rectangles with short text) sit close to
-   connector midpoints → treat as edge labels ("Yes", "No", …).
-4. Emit `flowchart LR` (if avg edge horizontal) or `flowchart TD` (vertical).
+1. Every connector (`p:cxnSp` or a line) resolves its two ends to the shapes it
+   is glued to (`a:stCxn` / `a:endCxn` ids), or else to the text-bearing
+   shape whose box holds the end point. Text boxes count as nodes too — slide
+   diagrams are often bordered text boxes, not auto-shapes.
+2. The arrowheads (`a:headEnd` at the begin point, `a:tailEnd` at the end
+   point) give the direction. A connector with no arrow information at all is
+   read begin → end.
+3. Block arrows (`downArrow`, `rightArrow`, …) link the nearest box behind
+   them to the nearest box ahead.
+4. A short text box near a connector's midpoint is that edge's label.
 
-Node shape mapping (Mermaid syntax):
-- Rounded rectangle  → `([label])`
-- Rectangle          → `[label]`
-- Diamond / decision → `{label}`
-- Oval               → `((label))`
-- Others             → `[label]`
-
-Return `None` if the structure can't be recovered cleanly (missing shapes for
-connector endpoints, degenerate layout). Caller then falls back to raster+VLM.
+The result lists nodes, edges, the shapes it consumed and ready Mermaid; the
+edges double as exact connector hints for slide vision. `None` when fewer than
+two edges resolve — then the slide is not treated as a diagram.
 """
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from pptx.enum.shapes import MSO_SHAPE, MSO_SHAPE_TYPE
+from .pptx_shapes import ShapeInfo, collect_shapes
 
-def _shape_style_map() -> dict:
-    """Build the auto-shape → mermaid-node-open map, tolerant to enum members
-    that may not exist across python-pptx versions."""
-    result = {}
-    _pairs = [
-        ("RECTANGLE",           "["),
-        ("ROUNDED_RECTANGLE",   "(["),
-        ("DIAMOND",             "{"),
-        ("FLOWCHART_DECISION",  "{"),
-        ("OVAL",                "(("),
-        ("FLOWCHART_CONNECTOR", "(("),
-        ("FLOWCHART_TERMINATOR", "(["),
-    ]
-    for name, open_ in _pairs:
-        member = getattr(MSO_SHAPE, name, None)
-        if member is not None:
-            result[member] = open_
-    return result
-
-
-_NODE_SHAPE_STYLE = _shape_style_map()
-
-_CLOSE = {"[": "]", "([": "])", "{": "}", "((": "))"}
-
-# Bounding-box match tolerance for connector endpoints (EMU)
-_MATCH_TOL = 91440  # ≈ 0.1 inch
-# Textbox-as-label proximity to connector midpoint (EMU)
-_LABEL_PROX = 685800  # ≈ 0.75 inch
-# Max label length to still count as an edge label (avoid grabbing paragraphs)
-_MAX_LABEL_LEN = 24
+# Preset geometry → Mermaid node brackets (label always quoted).
+_NODE_BRACKETS = {
+    "roundRect": ("([", "])"),
+    "flowChartTerminator": ("([", "])"),
+    "flowChartAlternateProcess": ("([", "])"),
+    "diamond": ("{", "}"),
+    "flowChartDecision": ("{", "}"),
+    "ellipse": ("((", "))"),
+    "flowChartConnector": ("((", "))"),
+}
+_BLOCK_ARROWS = {
+    "rightArrow": (1, 0), "notchedRightArrow": (1, 0), "stripedRightArrow": (1, 0),
+    "leftArrow": (-1, 0), "upArrow": (0, -1), "downArrow": (0, 1),
+}
+_END_TOL = 0.015        # connector end may stop this far (share of slide width) from a box
+_LABEL_DIST = 0.08      # edge label centre within this share of slide width of the midpoint
+_LABEL_MAX_CHARS = 24
+_ARROW_REACH = 0.12     # block arrow → box gap, share of slide size
 
 
 @dataclass
-class _Node:
-    idx: int
-    label: str
-    style_open: str
-    left: int
-    top: int
-    right: int
-    bottom: int
-
-    @property
-    def cx(self) -> float:
-        return (self.left + self.right) / 2
-
-    @property
-    def cy(self) -> float:
-        return (self.top + self.bottom) / 2
-
-    def contains(self, x: float, y: float, tol: int = _MATCH_TOL) -> bool:
-        return (self.left - tol <= x <= self.right + tol
-                and self.top - tol <= y <= self.bottom + tol)
-
-
-@dataclass
-class _Edge:
-    src: int
-    dst: int
+class FlowEdge:
+    src: ShapeInfo
+    dst: ShapeInfo
     label: str = ""
+    directed: bool = True
+    mid: tuple[float, float] | None = None  # connector / arrow midpoint, for labels
 
 
-def try_extract_mermaid(slide, shapes) -> str | None:
-    """Return Mermaid source, or None if extraction fails cleanly."""
-    nodes: list[_Node] = []
-    connectors: list = []
-    text_labels: list[tuple[int, int, str]] = []  # (cx, cy, text)
+@dataclass
+class Flow:
+    nodes: list[ShapeInfo]
+    edges: list[FlowEdge]
+    consumed: set[str] = field(default_factory=set)  # sids of nodes, connectors, arrows, labels
 
-    for shape in shapes:
-        st = shape.shape_type
-        if st == MSO_SHAPE_TYPE.AUTO_SHAPE:
-            try:
-                auto_type = shape.auto_shape_type
-            except (AttributeError, ValueError):
-                auto_type = None
-            style_open = _NODE_SHAPE_STYLE.get(auto_type, "[")
-            label = _clean_label(_shape_text(shape))
-            if not label:
+    @property
+    def bbox(self) -> tuple[float, float, float, float]:
+        return (min(n.left for n in self.nodes), min(n.top for n in self.nodes),
+                max(n.right for n in self.nodes), max(n.bottom for n in self.nodes))
+
+    def mermaid(self) -> str:
+        horizontal = sum(abs(e.dst.cx - e.src.cx) > abs(e.dst.cy - e.src.cy) for e in self.edges)
+        lines = [f"flowchart {'LR' if horizontal * 2 >= len(self.edges) else 'TD'}"]
+        ids = {n.sid: f"n{i}" for i, n in enumerate(self.nodes, start=1)}
+        for n in self.nodes:
+            open_, close = _NODE_BRACKETS.get(n.prst, ("[", "]"))
+            lines.append(f'    {ids[n.sid]}{open_}"{_label(n.text)}"{close}')
+        for e in self.edges:
+            arrow = "-->" if e.directed else "---"
+            if e.label:
+                arrow += f"|{_label(e.label).replace('|', ' ')}|"
+            lines.append(f"    {ids[e.src.sid]} {arrow} {ids[e.dst.sid]}")
+        return "\n".join(lines)
+
+    def hint_lines(self) -> list[str]:
+        """Edges in the CONNECTORS format page vision already knows."""
+        out = []
+        for e in self.edges:
+            suffix = f' (label "{e.label}")' if e.label else ""
+            if e.directed:
+                out.append(f'- "{e.src.text}" → "{e.dst.text}"{suffix}')
+            else:
+                out.append(f'- "{e.src.text}" — "{e.dst.text}" (line, no arrowhead){suffix}')
+        return out
+
+
+def _label(text: str) -> str:
+    return text.replace('"', "'").strip()
+
+
+def extract_flow(infos: list[ShapeInfo], slide_w: float, slide_h: float) -> Flow | None:
+    """The flowchart drawn on a slide, or None if fewer than two edges resolve."""
+    edges = resolve_edges(infos, slide_w, slide_h)
+    if len(edges) < 2:
+        return None
+    # Source order follows the flow: edges by where they start, nodes by
+    # first appearance — the diagram's entry point comes first.
+    horizontal = sum(abs(e.dst.cx - e.src.cx) > abs(e.dst.cy - e.src.cy) for e in edges) * 2 >= len(edges)
+    edges.sort(key=lambda e: (e.src.left, e.src.top) if horizontal else (e.src.top, e.src.left))
+    nodes: list[ShapeInfo] = []
+    for e in edges:
+        for n in (e.src, e.dst):
+            if n not in nodes:
+                nodes.append(n)
+    node_ids = [n.sid for n in nodes]
+    flow = Flow(nodes=nodes, edges=edges)
+    flow.consumed = set(node_ids) | _consumed_extras(infos, edges, slide_w)
+    return flow
+
+
+def resolve_edges(infos: list[ShapeInfo], slide_w: float, slide_h: float) -> list[FlowEdge]:
+    """Every connector and block arrow whose two ends land on different text shapes."""
+    candidates = [i for i in infos if i.kind == "text" and i.role not in ("title", "number", "footer", "date")]
+    by_sid = {i.sid: i for i in candidates}
+    tol = _END_TOL * slide_w
+
+    def _at(sid: list, point) -> ShapeInfo | None:
+        if sid and sid[0] in by_sid:
+            return by_sid[sid[0]]
+        x, y = point
+        hits = [c for c in candidates if c.contains(x, y, tol)]
+        return min(hits, key=lambda c: c.area) if hits else None
+
+    edges: list[FlowEdge] = []
+    for c in (i for i in infos if i.kind == "connector" and i.begin and i.end):
+        el = c.shape._element
+        a = _at(el.xpath(".//a:stCxn/@id"), c.begin)
+        b = _at(el.xpath(".//a:endCxn/@id"), c.end)
+        if a is None or b is None or a is b:
+            continue
+        head = _arrow(el, "headEnd")   # at the begin point
+        tail = _arrow(el, "tailEnd")   # at the end point
+        if head is True and tail is not True:
+            a, b = b, a
+        directed = bool(head or tail) or (head is None and tail is None)
+        mid = ((c.begin[0] + c.end[0]) / 2, (c.begin[1] + c.end[1]) / 2)
+        edges.append(FlowEdge(a, b, directed=directed, mid=mid))
+
+    for arrow in (i for i in infos if i.prst in _BLOCK_ARROWS):
+        pair = _block_arrow_ends(arrow, candidates, slide_w, slide_h)
+        if pair:
+            edges.append(FlowEdge(pair[0], pair[1], label=arrow.text, mid=(arrow.cx, arrow.cy)))
+
+    _attach_labels(edges, infos, candidates, slide_w)
+    seen: set[tuple[str, str]] = set()
+    unique = []
+    for e in edges:
+        key = (e.src.sid, e.dst.sid)
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
+    return unique
+
+
+def _arrow(el, tag: str) -> bool | None:
+    """True/False for an explicit arrowhead or none at that end; None if the
+    line carries no arrow information at all."""
+    vals = el.xpath(f"./p:spPr/a:ln/a:{tag}/@type")
+    if not vals:
+        return None
+    return str(vals[0]) != "none"
+
+
+def _block_arrow_ends(arrow: ShapeInfo, boxes: list[ShapeInfo], slide_w: float,
+                      slide_h: float) -> tuple[ShapeInfo, ShapeInfo] | None:
+    dx, dy = _BLOCK_ARROWS[arrow.prst]
+    reach = _ARROW_REACH * (slide_w if dx else slide_h)
+
+    def _pick(sign: int) -> ShapeInfo | None:
+        best, best_gap = None, reach
+        for b in boxes:
+            if b is arrow:
                 continue
-            left, top = int(shape.left or 0), int(shape.top or 0)
-            width, height = int(shape.width or 0), int(shape.height or 0)
-            nodes.append(_Node(
-                idx=len(nodes),
-                label=label,
-                style_open=style_open,
-                left=left, top=top,
-                right=left + width, bottom=top + height,
-            ))
-        elif st == MSO_SHAPE_TYPE.LINE:
-            connectors.append(shape)
-        elif st == MSO_SHAPE_TYPE.TEXT_BOX:
-            label_text = _clean_label(_shape_text(shape))
-            if 0 < len(label_text) <= _MAX_LABEL_LEN:
-                left, top = int(shape.left or 0), int(shape.top or 0)
-                width, height = int(shape.width or 0), int(shape.height or 0)
-                text_labels.append((left + width // 2, top + height // 2, label_text))
+            if dx:  # horizontal arrow: box must overlap vertically
+                if b.bottom < arrow.top or b.top > arrow.bottom:
+                    continue
+                gap = (b.left - arrow.right) if dx * sign > 0 else (arrow.left - b.right)
+            else:
+                if b.right < arrow.left or b.left > arrow.right:
+                    continue
+                gap = (b.top - arrow.bottom) if dy * sign > 0 else (arrow.top - b.bottom)
+            if -reach * 0.25 <= gap < best_gap:
+                best, best_gap = b, gap
+        return best
 
-    if len(nodes) < 2 or not connectors:
+    ahead, behind = _pick(1), _pick(-1)
+    if ahead is None or behind is None or ahead is behind:
         return None
+    return behind, ahead
 
-    edges: list[_Edge] = []
-    horizontal_edges = 0
-    for c in connectors:
-        try:
-            bx, by, ex, ey = _connector_endpoints(c)
-        except Exception:
+
+def _attach_labels(edges: list[FlowEdge], infos: list[ShapeInfo], nodes: list[ShapeInfo],
+                   slide_w: float) -> None:
+    """Each short free text box goes to the edge whose midpoint is nearest."""
+    used = {e.src.sid for e in edges} | {e.dst.sid for e in edges}
+    for t in infos:
+        if t.kind != "text" or t.sid in used or not (0 < len(t.text) <= _LABEL_MAX_CHARS):
             continue
-        src = _nearest_node(nodes, bx, by)
-        dst = _nearest_node(nodes, ex, ey)
-        if src is None or dst is None or src.idx == dst.idx:
+        if t.role in ("title", "number", "footer", "date"):
             continue
-        # Edge label from nearby textbox (near midpoint)
-        mx, my = (bx + ex) // 2, (by + ey) // 2
-        label = _find_label_near(text_labels, mx, my)
-        edges.append(_Edge(src=src.idx, dst=dst.idx, label=label))
-        if abs(ex - bx) > abs(ey - by):
-            horizontal_edges += 1
-
-    if not edges:
-        return None
-    # Require at least half of nodes to be connected — otherwise structure is
-    # too sparse to be trusted as a graph.
-    connected: set[int] = set()
-    for e in edges:
-        connected.add(e.src)
-        connected.add(e.dst)
-    if len(connected) / len(nodes) < 0.5:
-        return None
-
-    direction = "LR" if horizontal_edges >= len(edges) / 2 else "TD"
-    lines = [f"flowchart {direction}"]
-    for n in nodes:
-        if n.idx not in connected:
-            continue  # skip orphans (decorative shapes without edges)
-        open_ = n.style_open
-        close_ = _CLOSE[open_]
-        lines.append(f"    N{n.idx}{open_}{_escape_label(n.label)}{close_}")
-    for e in edges:
-        arrow = f"-->|{_escape_label(e.label)}|" if e.label else "-->"
-        lines.append(f"    N{e.src} {arrow} N{e.dst}")
-    return "\n".join(lines)
+        best, best_d = None, _LABEL_DIST * slide_w
+        for e in edges:
+            if e.label:
+                continue
+            mx, my = e.mid or ((e.src.cx + e.dst.cx) / 2, (e.src.cy + e.dst.cy) / 2)
+            d = ((t.cx - mx) ** 2 + (t.cy - my) ** 2) ** 0.5
+            if d < best_d:
+                best, best_d = e, d
+        if best is not None:
+            best.label = t.text
 
 
-def _shape_text(shape) -> str:
-    try:
-        return shape.text_frame.text or ""
-    except Exception:
-        return ""
+def _consumed_extras(infos: list[ShapeInfo], edges: list[FlowEdge], slide_w: float) -> set[str]:
+    labels = {e.label for e in edges if e.label}
+    out: set[str] = set()
+    for i in infos:
+        if i.kind == "connector" or i.prst in _BLOCK_ARROWS:
+            out.add(i.sid)
+        elif i.kind == "text" and i.text in labels and len(i.text) <= _LABEL_MAX_CHARS:
+            out.add(i.sid)
+    return out
 
 
-def _clean_label(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def _escape_label(text: str) -> str:
-    # Mermaid: strip pipes (they'd break edge-label syntax) and brackets that
-    # confuse the parser. Preserve the essential content.
-    return (text.replace("|", " ").replace("[", "(").replace("]", ")").replace('"', "'"))
-
-
-def _connector_endpoints(shape) -> tuple[int, int, int, int]:
-    """Return (begin_x, begin_y, end_x, end_y) in EMU for a LINE/connector."""
-    # python-pptx exposes .begin_x, .begin_y, .end_x, .end_y on connectors
-    return (int(shape.begin_x), int(shape.begin_y),
-            int(shape.end_x), int(shape.end_y))
-
-
-def _nearest_node(nodes: list[_Node], x: float, y: float) -> _Node | None:
-    """Find the node whose bbox contains (x, y) with tolerance, or the closest
-    if none contain it. Returns None if closest is > 2× tolerance away."""
-    containing = [n for n in nodes if n.contains(x, y)]
-    if containing:
-        # Pick the smallest bbox (tightest match) if multiple contain
-        return min(containing, key=lambda n: (n.right - n.left) * (n.bottom - n.top))
-    # No container — find closest center within reasonable range
-    best = None
-    best_dist = float("inf")
-    for n in nodes:
-        dx, dy = n.cx - x, n.cy - y
-        dist = (dx * dx + dy * dy) ** 0.5
-        if dist < best_dist:
-            best_dist = dist
-            best = n
-    if best is None or best_dist > _MATCH_TOL * 3:
-        return None
-    return best
-
-
-def _find_label_near(labels: list[tuple[int, int, str]], mx: int, my: int) -> str:
-    best = ""
-    best_dist = _LABEL_PROX
-    for lx, ly, text in labels:
-        dx, dy = lx - mx, ly - my
-        dist = (dx * dx + dy * dy) ** 0.5
-        if dist < best_dist:
-            best_dist = dist
-            best = text
-    return best
+def try_extract_mermaid(slide, shapes=None) -> str | None:
+    """Mermaid for a slide that is a shape diagram, or None. (Kept for callers
+    of the pre-2026-09-30 API; `shapes` is ignored.)"""
+    prs_part = slide.part.package.presentation_part.presentation
+    flow = extract_flow(collect_shapes(slide), prs_part.slide_width, prs_part.slide_height)
+    return flow.mermaid() if flow else None

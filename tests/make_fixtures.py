@@ -1,4 +1,5 @@
 """Generate test fixtures: PNG diagram, sample PDF, sample PPTX."""
+import io
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -201,6 +202,252 @@ def make_sample_pptx() -> Path:
     )
 
     out = FIX / "sample.pptx"
+    prs.save(out)
+    return out
+
+
+def _table_png() -> bytes:
+    """A two-column factor table drawn as a bitmap (no text layer)."""
+    rows = [("Tahun", "Nilai"), ("2031", "18,40"), ("2032", "17,95"), ("2033", "17,20"), ("2034", "16,85")]
+    img = Image.new("RGB", (320, 30 * len(rows)), "white")
+    d = ImageDraw.Draw(img)
+    for i, (a, b) in enumerate(rows):
+        y = 30 * i
+        if i == 0:
+            d.rectangle([0, 0, 319, 29], fill=(40, 60, 90))
+        d.rectangle([0, y, 319, y + 29], outline="black")
+        d.line([140, y, 140, y + 29], fill="black")
+        colour = "white" if i == 0 else "black"
+        d.text((20, y + 5), a, fill=colour, font=_font(18))
+        d.text((160, y + 5), b, fill=colour, font=_font(18))
+    return _png_bytes(img)
+
+
+def _transparent_text_png() -> bytes:
+    """Black text on a transparent background, stored the way slide exports
+    store it: a palette PNG whose transparent entry is black (0, 0, 0)."""
+    img = Image.new("P", (900, 110), 0)
+    img.putpalette([0, 0, 0, 0, 0, 0] + [0] * 762)  # entry 0 transparent, entry 1 opaque, both black
+    d = ImageDraw.Draw(img)
+    d.text((10, 10), "Layanan ini bersifat opsional dan dapat diaktifkan oleh setiap anggota.",
+           fill=1, font=_font(26))
+    d.text((10, 60), "1. Pendaftaran dibuka setiap awal bulan.", fill=1, font=_font(26))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", transparency=bytes([0, 255]))
+    return buf.getvalue()
+
+
+def _logo_png(scale: float = 1.0, pad: int = 4) -> bytes:
+    """A made-up brand logo on a transparent background; `scale`/`pad` give
+    the re-exported variants a deck typically carries."""
+    w, h = int(200 * scale), int(50 * scale)
+    img = Image.new("RGBA", (w + 2 * pad, h + 2 * pad), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.polygon([(pad, pad + h), (pad + h * 0.8, pad), (pad + h * 0.8, pad + h)], fill=(20, 120, 200, 255))
+    d.text((pad + int(h * 0.95), pad + int(h * 0.2)), "NORDVIK", fill=(40, 40, 60, 255),
+           font=_font(int(28 * scale)))
+    return _png_bytes(img)
+
+
+def _png_bytes(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _add_ext(pic, xpath: str, uri: str, child_xml: str) -> None:
+    """Append `<a:ext uri=...>child</a:ext>` to the extLst of the node at `xpath`."""
+    from lxml import etree
+    a = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    node = pic._element.xpath(xpath)[0]
+    ext_lst = node.find(f"{{{a}}}extLst")
+    if ext_lst is None:
+        ext_lst = etree.SubElement(node, f"{{{a}}}extLst")
+    ext = etree.SubElement(ext_lst, f"{{{a}}}ext")
+    ext.set("uri", uri)
+    ext.append(etree.fromstring(child_xml))
+
+
+def make_pictures_pptx() -> Path:
+    """Pictures that must NOT be handled by their surface: a table as a
+    bitmap, text on a transparent background, a logo repeated with another
+    crop, an Office library icon, a picture marked decorative, and one whose
+    alt text Office generated."""
+    prs = Presentation()
+    blank = prs.slide_layouts[5]  # title only
+    s1 = prs.slides.add_slide(blank)
+    s1.shapes.title.text = "Nilai per Tahun"
+    s1.shapes.add_picture(io.BytesIO(_logo_png()), Inches(0.2), Inches(0.1), width=Inches(1.4))
+    s1.shapes.add_picture(io.BytesIO(_table_png()), Inches(5), Inches(1.6), width=Inches(4))
+    s1.shapes.add_picture(io.BytesIO(_transparent_text_png()), Inches(0.5), Inches(5.2), width=Inches(9))
+
+    icon = s1.shapes.add_picture(io.BytesIO(_logo_png(0.5)), Inches(0.3), Inches(4.4), width=Inches(0.5))
+    _set_pic_alt(icon, "Bullseye outline")
+    rid = icon._element.xpath(".//*[local-name()='blip']/@*[local-name()='embed']")[0]
+    _add_ext(icon, ".//*[local-name()='blip']", "{96DAC541-7B7A-43D3-8B79-37D633B846F1}",
+             '<asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" '
+             'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+             f'r:embed="{rid}"/>')
+
+    deco = s1.shapes.add_picture(io.BytesIO(_logo_png(0.7, pad=12)), Inches(8.5), Inches(0.1), width=Inches(1))
+    _add_ext(deco, ".//*[local-name()='cNvPr']", "{C183D7F6-B498-43B3-948B-1728B52AA6E4}",
+             '<adec:decorative xmlns:adec="http://schemas.microsoft.com/office/drawing/2017/decorative" '
+             'val="1"/>')
+
+    s2 = prs.slides.add_slide(blank)
+    s2.shapes.title.text = "Contoh Perhitungan"
+    s2.shapes.add_picture(io.BytesIO(_logo_png(1.3, pad=20)), Inches(0.2), Inches(0.1), width=Inches(1.6))
+    auto = s2.shapes.add_picture(io.BytesIO(_table_png()), Inches(1), Inches(2), width=Inches(4))
+    _set_pic_alt(auto, "A table with numbers and text. Description automatically generated")
+
+    out = FIX / "pictures.pptx"
+    prs.save(out)
+    return out
+
+
+def _para_xml(p, *, bullet: str | None = None, mar_l: int | None = None, indent: int | None = None,
+              size: int = 16, bold: bool | None = None) -> None:
+    """Set a paragraph's list formatting the way PowerPoint writes it."""
+    from lxml import etree
+    a = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    ppr = p._p.get_or_add_pPr()
+    if mar_l is not None:
+        ppr.set("marL", str(mar_l))
+    if indent is not None:
+        ppr.set("indent", str(indent))
+    if bullet == "none":
+        etree.SubElement(ppr, f"{{{a}}}buNone")
+    elif bullet == "number":
+        etree.SubElement(ppr, f"{{{a}}}buAutoNum").set("type", "arabicPeriod")
+    elif bullet == "char":
+        etree.SubElement(ppr, f"{{{a}}}buFont").set("typeface", "Arial")
+        etree.SubElement(ppr, f"{{{a}}}buChar").set("char", "•")
+    for r in p.runs:
+        r.font.size = Pt(size)
+        if bold is not None:
+            r.font.bold = bold
+
+
+def _text_box(slide, left, top, width, height, paras, *, border=False, size=16, fill_white=False):
+    """paras: list of (text, kwargs for _para_xml)."""
+    from pptx.dml.color import RGBColor
+    tb = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+    tf = tb.text_frame
+    tf.word_wrap = True
+    for i, (text, kw) in enumerate(paras):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.text = text
+        _para_xml(p, size=kw.pop("size", size), **kw)
+    if border:
+        tb.line.color.rgb = RGBColor(0x1F, 0x4E, 0x78)
+    if fill_white:
+        tb.fill.solid()
+        tb.fill.fore_color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+    return tb
+
+
+def _connect(slide, a, a_pt, b, b_pt, *, elbow=False, arrow=True):
+    from lxml import etree
+    kind = MSO_CONNECTOR.ELBOW if elbow else MSO_CONNECTOR.STRAIGHT
+    c = slide.shapes.add_connector(kind, 0, 0, 0, 0)
+    c.begin_connect(a, a_pt)   # 0 top, 1 left, 2 bottom, 3 right
+    c.end_connect(b, b_pt)
+    ln = c.line._get_or_add_ln()
+    etree.SubElement(ln, "{http://schemas.openxmlformats.org/drawingml/2006/main}tailEnd").set(
+        "type", "triangle" if arrow else "none")
+    return c
+
+
+def _patched_text_png() -> tuple[bytes, tuple[int, int, int, int]]:
+    """A sentence as a transparent bitmap, plus the pixel box of the word the
+    slide patches over ("Lama")."""
+    font = _font(26)
+    before, word = "Anggota ", "Lama"
+    img = Image.new("P", (900, 60), 0)
+    img.putpalette([0, 0, 0, 0, 0, 0] + [0] * 762)
+    d = ImageDraw.Draw(img)
+    d.text((10, 12), "Anggota Lama dapat memilih pencairan tunai.", fill=1, font=font)
+    x0 = 10 + int(d.textlength(before, font=font))
+    x1 = x0 + int(d.textlength(word, font=font))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", transparency=bytes([0, 255]))
+    return buf.getvalue(), (x0 - 2, 8, x1 + 2, 48)
+
+
+def make_layout_pptx() -> Path:
+    """Three slides with the layouts real decks use and naive extraction
+    flattens: a text-box title with a soft break and a "Hal. 1" page number,
+    auto numbering mixed with hand-typed numbers, nested bullets and
+    continuation paragraphs; two columns and a native table; a flowchart of
+    bordered text boxes glued by connectors (straight, elbow, an edge label,
+    a block arrow) and a text bitmap with a word patched over it."""
+    from pptx.dml.color import RGBColor
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    blank = prs.slide_layouts[6]
+
+    s1 = prs.slides.add_slide(blank)
+    _text_box(s1, 2.5, 0.6, 8, 0.8, [("PROGRAM TABUNGAN ANGGOTA\vTahun 2027", {"bullet": "none", "size": 24})])
+    _text_box(s1, 0.3, 1.5, 12.5, 1.0, [("Tujuan:", {"bullet": "none"}),
+                                        ("Menjaga layanan tetap berjalan.", {"bullet": "none"})])
+    _text_box(s1, 0.3, 2.8, 12.5, 3.5, [
+        ("Biaya operasional naik", {"bullet": "number", "mar_l": 342900, "indent": -342900}),
+        ("Harga bahan naik", {"bullet": "char", "mar_l": 621030, "indent": -262255}),
+        ("Upah naik", {"bullet": "char", "mar_l": 621030, "indent": -262255}),
+        ("2.   Kewajiban lama besar", {}),
+        ("Penjelasan kewajiban lama.", {"bullet": "none", "mar_l": 358775}),
+        ("3.   Aset habis tahun 2030", {"bullet": "none"}),
+        ("Penjelasan aset.", {"bullet": "none", "mar_l": 358775}),
+    ])
+    _text_box(s1, 12.1, 7.0, 1.1, 0.35, [("Hal. 1", {"size": 12, "bold": True})])
+
+    s2 = prs.slides.add_slide(prs.slide_layouts[5])
+    s2.shapes.title.text = "DUA KOLOM"
+    for n, top in (("SATU", 1.5), ("DUA", 3.3), ("TIGA", 5.1)):
+        _text_box(s2, 0.5, top, 5.5, 1.6, [(f"KIRI {n}", {"bullet": "none", "bold": True}),
+                                           (f"Isi kiri {n.lower()}.", {"bullet": "none"})])
+    _text_box(s2, 6.8, 2.4, 6, 1.5, [("KANAN SATU", {"bullet": "none", "bold": True}),
+                                     ("Isi kanan satu.", {"bullet": "none"})])
+    table = s2.shapes.add_table(3, 2, Inches(6.8), Inches(4.5), Inches(6), Inches(1.5)).table
+    for r, (k, v) in enumerate((("Tahun", "Nilai"), ("2031", "18,40"), ("2032", "17,95"))):
+        table.cell(r, 0).text, table.cell(r, 1).text = k, v
+
+    s3 = prs.slides.add_slide(blank)
+    _text_box(s3, 1.0, 0.2, 8, 0.7, [("ALUR PROGRAM TABUNGAN", {"bullet": "none", "size": 24, "bold": True})])
+    box = {}
+    for key, text, x, y, w in (("A", "Program Tabungan", 0.2, 2.2, 2.0), ("B", "Bersifat opsional", 2.6, 2.2, 1.6),
+                               ("C", "Anggota Lama", 4.6, 0.9, 2.0), ("D", "Anggota Baru", 4.6, 3.4, 2.0),
+                               ("E", "Pencairan Tunai", 7.4, 0.9, 1.8), ("F", "Pindah ke Reksa Dana", 7.4, 3.4, 1.8),
+                               ("G", "Target: 50% peserta ikut", 10.3, 1.4, 2.6), ("H", "EVALUASI", 10.3, 3.9, 2.6)):
+        box[key] = _text_box(s3, x, y, w, 0.6, [(text, {"bullet": "none"})], border=True)
+    _connect(s3, box["A"], 3, box["B"], 1)
+    _connect(s3, box["B"], 3, box["C"], 1, elbow=True)
+    _connect(s3, box["B"], 3, box["D"], 1, elbow=True)
+    _connect(s3, box["C"], 3, box["E"], 1)
+    _connect(s3, box["D"], 3, box["F"], 1)
+    _connect(s3, box["E"], 3, box["G"], 1, elbow=True)
+    _connect(s3, box["F"], 3, box["G"], 1, elbow=True)
+    _text_box(s3, 6.75, 0.55, 0.5, 0.35, [("ya", {"bullet": "none", "size": 12})])
+    arrow = s3.shapes.add_shape(MSO_SHAPE.DOWN_ARROW, Inches(11.3), Inches(2.1), Inches(0.6), Inches(1.7))
+    arrow.fill.solid()
+    arrow.fill.fore_color.rgb = RGBColor(0x1F, 0x77, 0xB4)
+    divider = s3.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(0), Inches(4.8), Inches(13.333), Inches(4.8))
+    divider.line.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+    png, (px0, py0, px1, py1) = _patched_text_png()
+    pic_left, pic_top, pic_w = Inches(0.5), Inches(5.4), Inches(9)
+    pic = s3.shapes.add_picture(io.BytesIO(png), pic_left, pic_top, width=pic_w)
+    emu = pic_w / 900
+    patch = s3.shapes.add_textbox(pic_left + int(px0 * emu), pic_top + int(py0 * emu),
+                                  int((px1 - px0) * emu), int((py1 - py0) * emu))
+    patch.text_frame.text = "Baru"
+    patch.text_frame.margin_left = patch.text_frame.margin_top = 0
+    _para_xml(patch.text_frame.paragraphs[0], bullet="none", size=18)
+    patch.fill.solid()
+    patch.fill.fore_color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+    assert pic._element.getparent() is patch._element.getparent()
+
+    out = FIX / "layout.pptx"
     prs.save(out)
     return out
 
@@ -618,3 +865,7 @@ if __name__ == "__main__":
     print(f"HTML:           {p9}")
     p10 = make_slide_deck_pdf()
     print(f"PDF (slides):   {p10}")
+    p11 = make_pictures_pptx()
+    print(f"PPTX (images):  {p11}")
+    p12 = make_layout_pptx()
+    print(f"PPTX (layout):  {p12}")

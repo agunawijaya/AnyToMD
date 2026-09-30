@@ -737,6 +737,11 @@ class OptionsPanel(QWidget):
         ("Selalu — setiap halaman (juga Ollama)",     "always"),
         ("Tidak pernah — ekstraksi teks biasa",       "never"),
     ]
+    _SLIDE_VISION_LABELS = [
+        ("Auto — provider cloud",                      "auto"),
+        ("Selalu — setiap slide (juga Ollama)",       "always"),
+        ("Tidak pernah — susunan dari XML saja",      "never"),
+    ]
     _OCR_ENGINE_LABELS = [
         ("Tesseract (offline, ringan)",               "tesseract"),
         ("PaddleOCR (offline, akurat, heavy)",        "paddleocr"),
@@ -813,8 +818,8 @@ class OptionsPanel(QWidget):
 
         row.addWidget(ocr_grp, stretch=1)
 
-        # --- PDF slide deck: AI reads each rendered page ---
-        pv_grp = QGroupBox("PDF slide → AI per halaman")
+        # --- Slides (PDF slide decks, PPTX): AI reads each rendered page ---
+        pv_grp = QGroupBox("Slide → AI per halaman")
         pv_form = QFormLayout(pv_grp)
         pv_form.setLabelAlignment(Qt.AlignRight)
         self.page_vision_combo = QComboBox()
@@ -829,7 +834,20 @@ class OptionsPanel(QWidget):
             "dibaca AI dari gambar halaman, dengan teks asli PDF sebagai acuan.\n"
             "Satu panggilan AI per halaman."
         )
-        pv_form.addRow("Mode:", self.page_vision_combo)
+        pv_form.addRow("PDF:", self.page_vision_combo)
+        self.slide_vision_combo = QComboBox()
+        for label, _val in self._SLIDE_VISION_LABELS:
+            self.slide_vision_combo.addItem(label)
+        for i, (_lbl, val) in enumerate(self._SLIDE_VISION_LABELS):
+            if val == defaults.pptx_slide_vision:
+                self.slide_vision_combo.setCurrentIndex(i)
+                break
+        self.slide_vision_combo.setToolTip(
+            "Setiap slide PPTX dirender (PowerPoint bila terpasang) dan disusun AI:\n"
+            "judul, kolom, panel. Teks, tabel, gambar, dan diagram tetap diambil\n"
+            "persis dari file. Satu panggilan AI per slide."
+        )
+        pv_form.addRow("PPTX:", self.slide_vision_combo)
         row.addWidget(pv_grp, stretch=1)
 
     def collect(self) -> ConvertOptions:
@@ -847,6 +865,9 @@ class OptionsPanel(QWidget):
         pv_idx = self.page_vision_combo.currentIndex()
         page_vision = (self._PAGE_VISION_LABELS[pv_idx][1]
                        if 0 <= pv_idx < len(self._PAGE_VISION_LABELS) else "auto")
+        sv_idx = self.slide_vision_combo.currentIndex()
+        slide_vision = (self._SLIDE_VISION_LABELS[sv_idx][1]
+                        if 0 <= sv_idx < len(self._SLIDE_VISION_LABELS) else "auto")
 
         return ConvertOptions(
             image_dedup=self.dedup_check.isChecked(),
@@ -857,6 +878,7 @@ class OptionsPanel(QWidget):
             ocr_engine=ocr_engine,  # type: ignore[arg-type]
             ocr_lang=ocr_lang,
             pdf_page_vision=page_vision,  # type: ignore[arg-type]
+            pptx_slide_vision=slide_vision,  # type: ignore[arg-type]
         )
 
 

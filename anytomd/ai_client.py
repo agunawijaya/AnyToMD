@@ -1,23 +1,48 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import re
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, NamedTuple, Protocol
 
 from PIL import Image
 
 from .config import Config, cost_per_call, cost_per_anthropic_call
 
-ImageKind = Literal["diagram", "photo", "chart", "screenshot", "illustration", "other"]
+ImageKind = Literal["diagram", "photo", "chart", "table", "text", "screenshot", "illustration",
+                    "decorative", "other"]
 
 DESCRIBE_SYSTEM = (
     "You analyze images extracted from documents (PDF, PPTX) or standalone image files. "
     "Your job: (1) classify the image, (2) produce a concise factual description in the output "
     "language named in the context (default: Bahasa Indonesia), "
-    "(3) if it's a diagram/flowchart/graph/architecture with clear nodes and connections, generate valid "
+    "(3) if it's a table, transcribe it in full, "
+    "(4) if it's a diagram/flowchart/graph/architecture with clear nodes and connections, generate valid "
     "Mermaid syntax that reproduces it.\n\n"
+    "Kinds:\n"
+    "- table: text or numbers laid out in rows and columns, with or without borders.\n"
+    "- decorative: a logo, brand mark, icon, pictogram, ornament or background that adds no "
+    "information to the document. An icon stays decorative when it depicts people, arrows or "
+    "connections: a diagram has labelled boxes. DESCRIPTION is then a few words only "
+    "(e.g. `Logo ACME`).\n"
+    "- text: mostly running text (paragraphs or a list pasted as a picture). DESCRIPTION is "
+    "then one sentence naming what the text is about; the TEXT section holds the text itself "
+    "(see below).\n\n"
+    "Rules for TEXT:\n"
+    "- For KIND text: the text transcribed word for word in its own language — not a summary, "
+    "not translated — with numbered or bulleted items as a Markdown list.\n"
+    "- For any other kind, TEXT is the literal word NONE.\n\n"
+    "Rules for TABLE:\n"
+    "- For KIND table: a GitHub Markdown table with every row and every column. Copy each cell "
+    "exactly as shown: digits, decimal commas, symbols (… – %), capitalisation. Never round, "
+    "summarize or skip rows. A header that wraps onto two lines is one cell. DESCRIPTION is "
+    "then one sentence naming what the table shows.\n"
+    "- Several tables side by side with the same header are ONE table continued: output a "
+    "single table, rows in reading order (down the left table, then down the next one). "
+    "Tables with different headers → separate Markdown tables, one blank line between them.\n"
+    "- For any other kind, TABLE is the literal word NONE.\n\n"
     "Rules for Mermaid:\n"
     "- Only produce Mermaid when the image is genuinely a structural diagram (flowchart, sequence, class, "
     "ER, state, gantt, mindmap, architecture). Do NOT invent Mermaid for photos, screenshots, charts of "
@@ -40,12 +65,24 @@ DESCRIBE_SYSTEM = (
     "  A [Yes] --> B         (space between id and bracket)\n"
     "  A --> Pass? [X]        (`?` in bare id; label with space)\n"
     "  A([Yes]) --> B         (accidentally made A a stadium-node)\n\n"
-    "Output STRICT format (three sections separated by lines containing only `---`):\n"
-    "KIND: <one of: diagram, photo, chart, screenshot, illustration, other>\n"
+    "Output STRICT format (five sections separated by lines containing only `---`):\n"
+    "KIND: <one of: diagram, photo, chart, table, text, screenshot, illustration, decorative, "
+    "other>\n"
     "---\n"
     "DESCRIPTION: <2-5 sentences in the output language describing what the image shows>\n"
     "---\n"
+    "TABLE: <Markdown table(s), or the literal word NONE>\n"
+    "---\n"
+    "TEXT: <the transcribed text, or the literal word NONE>\n"
+    "---\n"
     "MERMAID: <mermaid source, or the literal word NONE>"
+)
+
+TABLE_RETRY_HINT = (
+    "Your previous answer classified the image as a table but its TABLE section was missing "
+    "or not a valid Markdown table ({reason}). Regenerate the whole response following the "
+    "STRICT format; in TABLE output every row as `| cell | cell |`, with a `| --- | --- |` "
+    "line under the header row and the same number of cells in every row."
 )
 
 RETRY_HINT_TEMPLATE = (
@@ -64,12 +101,12 @@ RETRY_HINT_TEMPLATE = (
 # text layer → Markdown. The text layer pins the wording; the image supplies
 # the structure (tables without rulings, vector diagrams, reading order).
 PAGE_SYSTEM = (
-    "You convert ONE page of a presentation-style PDF (usually a slide) into clean "
+    "You convert ONE slide (from a PPTX file, or a presentation-style PDF page) into clean "
     "GitHub-flavored Markdown.\n\n"
     "You receive (1) an image of the rendered page and (2) the page's TEXT LAYER extracted "
-    "from the PDF: one entry per text block, prefixed with its position as fractions of the "
+    "from the file: one entry per text block, prefixed with its position as fractions of the "
     "page width (x) and height (y); continuation lines of a block are indented. The tags "
-    "below come straight from the PDF drawing and are exact:\n"
+    "below come straight from the file's drawing and are exact:\n"
     "- `{legend: X}` at the end of an entry: the box around this text is drawn in the "
     "colour/border of legend entry X. Use X as the item's category (e.g. its phase).\n"
     "- `{box Sn}` at the end of an entry: the box around this text has style Sn, listed under "
@@ -78,11 +115,17 @@ PAGE_SYSTEM = (
     "tail → head, by the text of the boxes at its ends, with the short text sitting on the "
     "connector as `label`. Take edges, arrow directions and edge labels from it, not from "
     "your reading of the image.\n"
-    "The tags themselves never appear in your output.\n\n"
+    "The tags themselves never appear in your output.\n"
+    "- `[[PICTURE n]]`, `[[TABLE n]]`, `[[CHART n]]` and `[[DIAGRAM n]]` entries are "
+    "placeholders: the exact content of that element (a table, a transcribed picture, a "
+    "flowchart) is inserted there afterwards. Write each placeholder exactly once, alone on "
+    "its own line, where the element belongs in the reading order. Never transcribe, "
+    "describe or redraw these elements yourself, and write no Figure line for them.\n\n"
     "Wording:\n"
     "- Copy wording from the text layer exactly, keeping its capitalisation. Do not "
     "paraphrase, translate, summarize, correct, or add words. Every text-layer entry must "
-    "appear in your output.\n"
+    "appear in your output. Entries may already carry Markdown — `**bold**`, list markers "
+    "`1.` / `-` with the slide's own numbering, indented continuation lines: keep them.\n"
     "- Never add content that is not on the page: no invented legends, captions, "
     "explanations, summaries or colour names.\n"
     "- Take STRUCTURE from the image: reading order, grouping, which label belongs to which "
@@ -130,6 +173,9 @@ PAGE_RETRY_TEMPLATE = (
     "Produce the full Markdown for the page again, following every rule, and fix these problems."
 )
 
+# A transcribed table (a few dozen rows) needs more room than a description.
+DESCRIBE_MAX_TOKENS = 4096
+
 # Rough multiplier over the per-image cost estimate for one page-vision call
 # (bigger prompt with the text layer, several times more output tokens).
 PAGE_COST_FACTOR = 4.0
@@ -145,20 +191,27 @@ class ImageAnalysis:
     # Silent results (decorative, tiny, repeated) produce no Markdown at all —
     # a placeholder per logo/background only buries the real content.
     silent: bool = False
+    table: str | None = None  # Markdown table(s) transcribed from a table image
+    text: str | None = None   # text transcribed from a picture of text
 
     def to_markdown_block(self, alt_hint: str = "image") -> str:
+        """Markdown for the picture where it sits in the document.
+
+        A table or a picture of text *is* document content: it comes out as
+        that content alone. Anything else is one `> **Gambar (kind):**` line
+        with the description, plus the Mermaid source for a diagram."""
         if self.silent:
             return ""
         if self.skipped:
             return f"> *[Gambar dilewati ({self.skip_reason}) — {alt_hint}]*"
-        parts = [
-            f"> **[Gambar dalam dokumen asli — {self.kind}]**",
-            "",
-            self.description.strip(),
-        ]
+        if self.table:
+            return self.table.strip()
+        if self.text:
+            return self.text.strip()
+        desc = " ".join(self.description.split())
+        parts = [f"> **Gambar ({self.kind}):** {desc}"]
         if self.mermaid:
             parts.extend(["", "```mermaid", self.mermaid.strip(), "```"])
-        parts.extend(["", f"*(Placeholder: {alt_hint})*"])
         return "\n".join(parts)
 
     @classmethod
@@ -211,7 +264,7 @@ class AnthropicClient:
 
     def _call(self, png_bytes: bytes, extra_context: str) -> str:
         return self._complete(png_bytes, DESCRIBE_SYSTEM, _describe_user_text(extra_context),
-                              2048)[0]
+                              DESCRIBE_MAX_TOKENS)[0]
 
     def _complete(self, png_bytes: bytes, system: str, user_text: str,
                   max_tokens: int) -> tuple[str, int, int]:
@@ -271,12 +324,12 @@ class OllamaClient:
 
     def _call(self, png_bytes: bytes, extra_context: str) -> str:
         return self._complete(png_bytes, DESCRIBE_SYSTEM, _describe_user_text(extra_context),
-                              2048)[0]
+                              DESCRIBE_MAX_TOKENS)[0]
 
     def _complete(self, png_bytes: bytes, system: str, user_text: str,
                   max_tokens: int) -> tuple[str, int, int]:
         options = {"temperature": 0.2, "num_predict": max_tokens}
-        if max_tokens > 2048:
+        if max_tokens >= PAGE_MAX_TOKENS:
             # Page transcription: image + text layer + long answer overflow
             # Ollama's small default context window.
             options["num_ctx"] = 16384
@@ -337,7 +390,7 @@ class OpenAIClient:
 
     def _call(self, png_bytes: bytes, extra_context: str) -> str:
         return self._complete(png_bytes, DESCRIBE_SYSTEM, _describe_user_text(extra_context),
-                              2048)[0]
+                              DESCRIBE_MAX_TOKENS)[0]
 
     def _complete(self, png_bytes: bytes, system: str, user_text: str,
                   max_tokens: int) -> tuple[str, int, int]:
@@ -412,7 +465,7 @@ class GeminiClient:
 
     def _call(self, png_bytes: bytes, extra_context: str) -> str:
         return self._complete(png_bytes, DESCRIBE_SYSTEM, _describe_user_text(extra_context),
-                              2048)[0]
+                              DESCRIBE_MAX_TOKENS)[0]
 
     def _complete(self, png_bytes: bytes, system: str, user_text: str,
                   max_tokens: int) -> tuple[str, int, int]:
@@ -455,6 +508,9 @@ class OptimizedAIClient:
       - min-bytes / min-dim (skip tiny)
       - diagram-only prefilter (image_mode="diagrams_only")
       - dedup by SHA-256 of image bytes
+      - with skip_decorative: pictures that look like one the model already
+        called decorative (the same logo on every slide, re-exported with
+        another crop or size) are skipped without a call
     Stats are counted on `options._stats` so the GUI can show savings.
     """
 
@@ -462,6 +518,7 @@ class OptimizedAIClient:
         self.inner = inner
         self.options = options
         self._cache: dict[str, ImageAnalysis] = {}
+        self._decorative_hashes: list[tuple[int, float]] = []
 
     @property
     def is_local(self) -> bool:
@@ -505,11 +562,20 @@ class OptimizedAIClient:
 
         # 4a. Decorative filter (solid blobs, gradient circles) — kills wasted
         # AI calls on cover-page filler. Cheap: ~10ms per image.
+        phash = None
         if opts.skip_decorative:
-            from .image_heuristics import is_decorative
+            from .image_heuristics import is_decorative, is_icon_sized, perceptual_hash, same_picture
+            if is_icon_sized(image_bytes):
+                stats["skipped_decorative"] = stats.get("skipped_decorative", 0) + 1
+                return ImageAnalysis.skipped_result("ikon kecil", silent=True)
             if is_decorative(image_bytes):
                 stats["skipped_decorative"] = stats.get("skipped_decorative", 0) + 1
                 return ImageAnalysis.skipped_result("gambar dekoratif (blob/lingkaran solid)",
+                                                    silent=True)
+            phash = perceptual_hash(image_bytes)
+            if phash and any(same_picture(phash, h) for h in self._decorative_hashes):
+                stats["skipped_decorative"] = stats.get("skipped_decorative", 0) + 1
+                return ImageAnalysis.skipped_result("logo/ikon yang sama sudah dinilai AI",
                                                     silent=True)
 
         # 4b. Diagram-only prefilter
@@ -529,14 +595,7 @@ class OptimizedAIClient:
                 stats["skipped_duplicate"] += 1
                 # Already described at its first occurrence — repeating the same
                 # paragraph (a logo on every page) is pure noise.
-                return ImageAnalysis(
-                    kind=cached.kind,
-                    description=cached.description,
-                    mermaid=cached.mermaid,
-                    skipped=False,
-                    skip_reason="",
-                    silent=True,
-                )
+                return dataclasses.replace(cached, silent=True)
 
         # 6. Actually call the real client
         stats["sent"] += 1
@@ -549,6 +608,10 @@ class OptimizedAIClient:
             stats["anthropic_calls"] = inner.anthropic_calls
         if cache_key is not None:
             self._cache[cache_key] = result
+        if result.kind == "decorative" and not result.skipped:
+            stats["ai_decorative"] = stats.get("ai_decorative", 0) + 1
+            if phash:
+                self._decorative_hashes.append(phash)
         return result
 
 
@@ -737,34 +800,87 @@ def wrap_with_options(client: "AIClient", options) -> "AIClient":
 # ---------- Analysis orchestration ----------
 
 def _analyze_with_retry(call_fn, png_bytes: bytes, extra_context: str) -> ImageAnalysis:
-    """Call the model, then if it tried Mermaid but produced invalid syntax,
-    auto-fix; if still invalid, retry once with an error hint."""
-    text = call_fn(png_bytes, extra_context)
-    kind, desc, raw_mermaid = _parse_sections(text)
-    mermaid, reasons = _finalize_mermaid(raw_mermaid)
+    """Call the model, then retry once with an error hint if it copied the
+    context's slide text into its answer, tried Mermaid but produced invalid
+    syntax (after autofix), or called the image a table without a usable
+    TABLE section. An answer that still copies the context is dropped."""
+    first = _parse_sections(call_fn(png_bytes, extra_context))
+    kind, desc, body_text = first.kind, first.description, first.text
+    table, table_problem = _finalize_table(first.table)
+    mermaid, reasons = _finalize_mermaid(first.mermaid)
+    echoed = _echoes_context(first, extra_context)
 
-    should_retry = (
-        kind == "diagram"
-        and raw_mermaid
-        and raw_mermaid.upper() != "NONE"
-        and mermaid is None
-    )
-    if should_retry:
+    hint = ""
+    if echoed:
+        hint = ECHO_RETRY_HINT
+    elif (kind == "diagram" and first.mermaid and first.mermaid.upper() != "NONE"
+            and mermaid is None):
         hint = RETRY_HINT_TEMPLATE.format(
-            prev=raw_mermaid.strip(),
+            prev=first.mermaid.strip(),
             reasons="; ".join(reasons) or "syntax error",
         )
-        text2 = call_fn(png_bytes, (extra_context + "\n\n" + hint).strip())
-        kind2, desc2, raw_mermaid2 = _parse_sections(text2)
-        mermaid2, _ = _finalize_mermaid(raw_mermaid2)
-        if mermaid2:
-            mermaid = mermaid2
-        if desc2 and len(desc2) > len(desc):
-            desc = desc2
-        if kind2 != "other":
-            kind = kind2
+    elif kind == "table" and table is None:
+        hint = TABLE_RETRY_HINT.format(reason=table_problem)
+    elif table is None and _TABLE_WORD_RE.search(desc) and kind not in ("diagram", "decorative"):
+        # "shows a table …" under another kind: small models describe the
+        # table instead of transcribing it.
+        hint = TABLE_RETRY_HINT.format(reason="the description says the image is a table, "
+                                              "but KIND was not table")
+    if hint:
+        second = _parse_sections(call_fn(png_bytes, (extra_context + "\n\n" + hint).strip()))
+        mermaid2, _ = _finalize_mermaid(second.mermaid)
+        table2, _ = _finalize_table(second.table)
+        if echoed:
+            if _echoes_context(second, extra_context):
+                return ImageAnalysis.skipped_result("model menyalin teks konteks", silent=True)
+            kind, desc, body_text = second.kind, second.description, second.text
+            table, mermaid = table2, mermaid2
+        else:
+            if mermaid2:
+                mermaid = mermaid2
+            if table2:
+                table = table2
+                desc = second.description or desc
+            elif second.description and len(second.description) > len(desc):
+                desc = second.description
+            body_text = body_text or second.text
+            if second.kind != "other":
+                kind = second.kind
 
-    return ImageAnalysis(kind=kind, description=desc, mermaid=mermaid)
+    # Small models label a logo "other"/"illustration" but still say what it is.
+    if kind not in ("table", "text", "diagram", "chart") and _LOGO_RE.match(desc.strip()):
+        kind = "decorative"
+    return ImageAnalysis(kind=kind, description=desc, mermaid=mermaid, table=table,
+                         text=body_text, silent=(kind == "decorative"))
+
+
+ECHO_RETRY_HINT = (
+    "Your previous answer copied the slide text from the context. The context is background "
+    "only: describe or transcribe what THIS image itself shows, nothing from the context."
+)
+_CONTEXT_TEXT_RE = re.compile(r"(?:Teks slide|Slide text): (.*)")
+_TABLE_WORD_RE = re.compile(r"\b(?:tabel|table)\b", re.IGNORECASE)
+_ECHO_WINDOW = 50
+_LOGO_RE = re.compile(
+    r"^(?:(?:gambar\s+ini|gambar|this\s+image|the\s+image|image|this)\s+"
+    r"(?:adalah|menampilkan|berisi|merupakan|shows|is|depicts)\s+)?"
+    r"(?:sebuah\s+|an?\s+|the\s+)?logo\b",
+    re.IGNORECASE,
+)
+
+
+def _echoes_context(answer: _Sections, extra_context: str) -> bool:
+    """True if the answer repeats a run of the surrounding slide text given
+    as context (small local models do this instead of reading the image)."""
+    m = _CONTEXT_TEXT_RE.search(extra_context or "")
+    if not m:
+        return False
+    ctx = " ".join(m.group(1).rstrip("…").split())
+    said = " ".join(" ".join(x for x in (answer.description, answer.text or "", answer.table or "")
+                             if x).split())
+    if len(ctx) < _ECHO_WINDOW:
+        return False
+    return any(ctx[i:i + _ECHO_WINDOW] in said for i in range(0, len(ctx) - _ECHO_WINDOW + 1, 10))
 
 
 def _describe_user_text(extra_context: str) -> str:
@@ -956,7 +1072,11 @@ def _normalize_image(data: bytes) -> bytes:
     """Convert to PNG and cap dimensions so uploads stay small."""
     img = Image.open(io.BytesIO(data))
     if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGB")
+        # Keep transparency: converting a palette PNG with a transparent
+        # background straight to RGB paints that background black, which
+        # hides black text.
+        has_alpha = img.mode in ("LA", "PA") or "transparency" in img.info
+        img = img.convert("RGBA" if has_alpha else "RGB")
     max_side = 1568
     if max(img.size) > max_side:
         ratio = max_side / max(img.size)
@@ -967,15 +1087,25 @@ def _normalize_image(data: bytes) -> bytes:
 
 
 _KIND_RE = re.compile(r"^KIND:\s*(\w+)", re.IGNORECASE | re.MULTILINE)
-_VALID_KINDS: set[str] = {"diagram", "photo", "chart", "screenshot", "illustration", "other"}
+_VALID_KINDS: set[str] = {"diagram", "photo", "chart", "table", "text", "screenshot", "illustration",
+                           "decorative", "other"}
 
 
-def _parse_sections(text: str) -> tuple[ImageKind, str, str | None]:
-    """Extract KIND / DESCRIPTION / raw MERMAID (no validation)."""
+class _Sections(NamedTuple):
+    kind: ImageKind
+    description: str
+    table: str | None    # raw, not validated
+    text: str | None     # None when absent or NONE
+    mermaid: str | None  # raw, not validated
+
+
+def _parse_sections(text: str) -> _Sections:
+    """Extract KIND / DESCRIPTION / TABLE / TEXT / MERMAID (no validation)."""
     sections = [s.strip() for s in re.split(r"^---\s*$", text, flags=re.MULTILINE)]
     kind: ImageKind = "other"
     description = ""
-    raw_mermaid: str | None = None
+    raw: dict[str, str | None] = {"table": None, "text": None, "mermaid": None}
+    fence_lang = {"table": "markdown|md", "text": "markdown|md|text", "mermaid": "mermaid"}
 
     for section in sections:
         low = section.lower().lstrip()
@@ -987,16 +1117,89 @@ def _parse_sections(text: str) -> tuple[ImageKind, str, str | None]:
                     kind = cand  # type: ignore[assignment]
         elif low.startswith("description:"):
             description = section.split(":", 1)[1].strip()
-        elif low.startswith("mermaid:"):
-            body = section.split(":", 1)[1].strip()
-            body = re.sub(r"^```(?:mermaid)?\s*", "", body)
-            body = re.sub(r"\s*```$", "", body)
-            if body:
-                raw_mermaid = body
+        else:
+            name = low.split(":", 1)[0].strip()
+            if name in raw and ":" in low:
+                body = section.split(":", 1)[1].strip()
+                body = re.sub(rf"^```(?:{fence_lang[name]})?\s*", "", body)
+                body = re.sub(r"\s*```$", "", body)
+                if body:
+                    raw[name] = body
 
     if not description:
         description = text.strip() or "(Tidak ada deskripsi)"
-    return kind, description, raw_mermaid
+    body_text = raw["text"]
+    if body_text and body_text.upper() == "NONE":
+        body_text = None
+    return _Sections(kind, description, raw["table"], body_text, raw["mermaid"])
+
+
+_TABLE_SEP_CELL_RE = re.compile(r"^:?-{3,}:?$")
+
+
+def _table_cells(line: str) -> list[str]:
+    """Cells of one `| a | b |` row; `\\|` inside a cell stays."""
+    inner = line.strip()
+    inner = inner[1:] if inner.startswith("|") else inner
+    inner = inner[:-1] if inner.endswith("|") and not inner.endswith("\\|") else inner
+    return [c.strip() for c in re.split(r"(?<!\\)\|", inner)]
+
+
+def _finalize_table(raw: str | None) -> tuple[str | None, str]:
+    """Return (normalized Markdown table(s) or None, what was wrong with it).
+
+    Accepts one or more pipe tables separated by blank or non-table lines.
+    Each needs a header row and a `---` separator row; short rows are padded,
+    a row with more cells than its header rejects the whole answer."""
+    if not raw or raw.strip().upper() == "NONE":
+        return None, "TABLE section empty"
+    groups: list[list[str]] = []
+    current: list[str] = []
+    for line in raw.splitlines():
+        if line.strip().startswith("|"):
+            current.append(line)
+        elif current:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    if not groups:
+        return None, "no `|` rows"
+
+    tables: list[str] = []
+    for group in groups:
+        rows = [_table_cells(ln) for ln in group]
+        if len(rows) < 3 or not all(_TABLE_SEP_CELL_RE.match(c) for c in rows[1]):
+            return None, "header row not followed by a `| --- |` separator row"
+        header, width = rows[0], len(rows[0])
+        body = rows[2:]
+        for i, r in enumerate(body, start=1):
+            if len(r) > width:
+                return None, f"row {i} has {len(r)} cells, header has {width}"
+        # a second `| --- |` row mid-table (a model stacking two halves) is not data
+        body = [r + [""] * (width - len(r)) for r in body
+                if not all(_TABLE_SEP_CELL_RE.match(c) for c in r)]
+        header, body = _unstack_side_by_side(header, body)
+        lines = ["| " + " | ".join(header) + " |",
+                 "| " + " | ".join("---" for _ in header) + " |"]
+        lines += ["| " + " | ".join(r) + " |" for r in body]
+        tables.append("\n".join(lines))
+    return "\n\n".join(tables), ""
+
+
+def _unstack_side_by_side(header: list[str], body: list[list[str]]) -> tuple[list[str], list[list[str]]]:
+    """`| Age | Factor | Age | Factor |` is one long table printed in two
+    halves side by side: stack the halves (left one first), dropping the
+    blank padding rows of a shorter half."""
+    width = len(header)
+    for k in range(1, width // 2 + 1):
+        if width % k or any(header[i] != header[i % k] for i in range(width)):
+            continue
+        if not any(header[:k]):
+            return header, body
+        stacked = [r[c:c + k] for c in range(0, width, k) for r in body]
+        return header[:k], [r for r in stacked if any(r)]
+    return header, body
 
 
 def _finalize_mermaid(raw: str | None) -> tuple[str | None, list[str]]:

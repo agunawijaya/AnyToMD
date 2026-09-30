@@ -69,7 +69,7 @@ Drag any PDF/PPTX/DOCX/XLSX/HTML/image into the drop zone, or press Ctrl+O.
 │    ║   PDF · PPTX · DOCX · XLSX · HTML   ║        click to browse)
 │    ╚═════════════════════════════════════╝     
 │                                                 
-│  [ Filter gambar ] [ OCR untuk PDF scan ] [ PDF slide → AI per halaman ]
+│  [ Filter gambar ] [ OCR untuk PDF scan ] [ Slide → AI per halaman  ]
 │                                                 
 ├──── draggable splitter ────────────────────────
 │  Preview                              [📋 Copy]  ← preview grows to fill
@@ -91,7 +91,7 @@ Keyboard shortcuts: `Ctrl+O` open · `Ctrl+S` save · `Ctrl+,` settings · `Ctrl
 Convert **PDF**, **PPTX**, **DOCX**, **XLSX**, **HTML**, and **PNG/JPG** files into clean Markdown.
 
 - **PDF** → strips repeated header/footer/page numbers, keeps body text, **detects tables via pdfplumber** and interleaves them with text by y-position, describes embedded images where they sit (in the document's language; logos/backgrounds repeated on most pages are skipped). **Scanned/image-only PDFs** can be OCR'd (auto-detect or forced) with a choice of engine: Tesseract, PaddleOCR, AI vision, or hybrid. **Slide decks exported to PDF** are read page by page by the vision model (cloud providers; `ANYTOMD_PDF_PAGE_VISION=auto|always|never`): Mermaid for boxes and arrows, tables for grids, legend colours written next to each item — wording copied from the PDF and checked.
-- **PPTX** → per-slide content + **speaker notes** + layout description + **native charts as markdown tables (zero AI)** + Mermaid diagrams for pictures **and** for native shape diagrams (auto-rasterized). **Author-supplied Alt Text is used verbatim, bypassing the AI.** Slide number & footer placeholders skipped.
+- **PPTX** → `## <slide title>` per slide, paragraphs with their **real bullets and numbering**, columns read in order, **native charts and tables as Markdown tables (zero AI)**, **flowcharts drawn with shapes + connectors → Mermaid straight from the XML (zero AI)**, pictures of tables/text transcribed, logos and icons dropped, a word patched over a picture read as the slide shows it, **speaker notes**. With a cloud provider each slide is also rendered (PowerPoint when installed, else PIL) and structured by the vision model — headings, panels — while every table, picture, chart and flowchart is filled in from the file (`ANYTOMD_PPTX_SLIDE_VISION=auto|always|never`). **Author-supplied Alt Text is used verbatim, bypassing the AI.** Page numbers, slide-number/footer placeholders skipped.
 - **DOCX** → headings, paragraphs, lists, tables (as MD tables), inline images described. Word headers/footers/page numbers are outside the document body, so they're naturally skipped.
 - **XLSX** → each sheet becomes its own `## Sheet: <name>` section with a Markdown table. Trailing empty rows/columns trimmed. Large sheets capped (5000 rows × 100 cols).
 - **HTML/HTM** → saved web pages / articles: strips `<script>/<style>/<nav>/<footer>/<aside>`, converts body via `markdownify`. Anchors dropped on link-heavy pages. No AI call.
@@ -198,7 +198,9 @@ Then drag & drop a file into the window, or use **Browse**. The `.md` output is 
 | PDF slide decks        | page render + vision model, anchored on the text layer and on vector hints (legend colour per box, connectors) read from the PDF drawing; coverage / invented-word / Mermaid checks with one retry |
 | Header/footer stripper | position (top/bottom 10%) + repeat-frequency ≥ 35%      |
 | PPTX parsing           | python-pptx (shapes, placeholders, tables, pictures, **charts**, **notes**) |
-| PPTX shape rasterizer  | Pillow — rectangles/rounded/oval/diamond + connectors   |
+| PPTX flowcharts        | connectors resolved by `stCxn`/`endCxn` ids, arrowheads, block arrows → Mermaid (no AI) |
+| PPTX layout            | titles, `buAutoNum`/`buChar` lists with depth from `marL`, XY-cut reading order, page-number boxes dropped |
+| PPTX slide render      | PowerPoint via COM (PowerShell) when installed, else Pillow; slide vision + crops of patched pictures |
 | PPTX alt-text          | Read `<p:cNvPr descr="…">` — bypass AI if ≥ 12 chars     |
 | DOCX parsing           | python-docx (body walk preserves para/table interleave) |
 | XLSX parsing           | openpyxl (`data_only=True` for formula results)         |
@@ -217,7 +219,8 @@ Untuk mode Anthropic, system prompt di-cache (`cache_control: ephemeral`) supaya
 |------|-----------|
 | PDF body text + header/footer/page# stripping | PyMuPDF + heuristik posisi/frekuensi |
 | **PDF tables (bordered)** | **pdfplumber `find_tables()` — 0 AI call** |
-| PPTX text, tabel, layout, judul, footer/slide-# skip | python-pptx |
+| PPTX text, bullet/penomoran, tabel, judul, urutan kolom, footer/slide-#/"Hal. N" skip | python-pptx + `pptx_layout` — **0 AI call** |
+| **PPTX flowchart (shape + connector) → Mermaid** | **XML `stCxn`/`endCxn` + panah — 0 AI call** |
 | **PPTX native chart → tabel MD** | **python-pptx `chart.plots[0]` — 0 AI call** |
 | **PPTX speaker notes** | **python-pptx `notes_slide` — 0 AI call** |
 | **PPTX picture dengan Alt Text penulis** | **XML `<p:cNvPr descr>` — 0 AI call, teks penulis dipakai verbatim** |
@@ -239,7 +242,8 @@ Anthropic system prompt di-cache (`cache_control: ephemeral`) — dokumen multi-
 | **XLSX apapun** | **0** — selalu |
 | PDF/PPTX/DOCX dengan gambar | 1 per gambar |
 | PDF slide deck, provider cloud (page vision `auto`) | 1 per halaman (+1 kalau hasil gagal cek) |
-| PPTX dengan shape diagram | 1 per slide shape-diagram (rasterized) |
+| PPTX, provider cloud (slide vision `auto`) | 1 per slide (+1 kalau hasil gagal cek) + 1 per gambar |
+| PPTX dengan shape diagram yang konektornya tak tersambung | 1 per slide (rasterized) |
 | Standalone PNG/JPG | 1 |
 
 ### Optimasi opt-in untuk file image-heavy
@@ -347,10 +351,14 @@ AnyToMD/
 │   ├── config.py            # .env loader
 │   ├── gui.py               # PySide6 desktop UI
 │   ├── slide_render.py      # PIL rasterizer for PPTX shape diagrams
+│   ├── pptx_render.py       # slide images: PowerPoint COM or PIL
 │   └── converters/
 │       ├── __init__.py      # dispatcher
 │       ├── pdf.py       # + pdfplumber (tables)
-│       ├── pptx.py      # + charts, notes, alt-text
+│       ├── pptx.py      # slides: layout, pictures, slide vision
+│       ├── pptx_layout.py        # titles, lists, reading order
+│       ├── pptx_shapes.py        # shape geometry (groups flattened)
+│       ├── pptx_shape_mermaid.py # connectors → Mermaid
 │       ├── docx.py
 │       ├── xlsx.py
 │       ├── html.py      # NEW

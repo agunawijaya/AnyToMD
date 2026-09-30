@@ -21,15 +21,15 @@ def convert(path: Path, ai: AIClient, progress: ProgressFn | None = None,
     skip-tiny, diagram-only, full-skip). Defaults to `all` (no filtering).
     """
     ext = path.suffix.lower()
-    # PDF needs the raw AI client for OCR (bypasses image-filter wrapper) — it
-    # wraps internally for its per-image analysis calls.
+    # PDF and PPTX need the raw AI client (OCR, page/slide vision) — they wrap
+    # internally for their per-image analysis calls.
     if ext == ".pdf":
         return convert_pdf(path, ai, progress, options=options)
+    if ext == ".pptx":
+        return convert_pptx(path, ai, progress, options=options)
     # Other formats: wrap here so all their image AI calls go through filters.
     if options is not None:
         ai = wrap_with_options(ai, options)
-    if ext == ".pptx":
-        return convert_pptx(path, ai, progress)
     if ext == ".docx":
         return convert_docx(path, ai, progress)
     if ext == ".xlsx":
